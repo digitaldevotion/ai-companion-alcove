@@ -1,0 +1,8 @@
+# Alcove upgrade overrides
+# List variable names (one per line) whose template value should
+# ALWAYS replace the user's existing value during upgrade.
+# Blank lines and lines starting with # are ignored.
+#
+# Example:
+# SEARCH_REFERENCES_ENABLED
+SEARCH_REFERENCES_ENABLED
