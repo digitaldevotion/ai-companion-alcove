@@ -6,3 +6,6 @@
 # Example:
 # SEARCH_REFERENCES_ENABLED
 SEARCH_REFERENCES_ENABLED
+
+# Auto-discovered from tools/ directory — force empty list on upgrade
+LOADED_TOOL_LOCATIONS

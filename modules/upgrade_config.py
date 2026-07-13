@@ -34,9 +34,13 @@ from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).parent.parent
-TEMPLATE_PATH = HERE / "config_template.py"
+TEMPLATE_PATH = HERE / "utils" / "config_template.py"
+if not TEMPLATE_PATH.exists():
+    TEMPLATE_PATH = HERE / "config_template.py"
 CONFIG_PATH = HERE / "config.py"
-OVERRIDES_PATH = Path(__file__).parent / "upgrade_overrides.dat"
+OVERRIDES_PATH = HERE / "utils" / "upgrade_overrides.dat"
+if not OVERRIDES_PATH.exists():
+    OVERRIDES_PATH = Path(__file__).parent / "upgrade_overrides.dat"
 
 
 def parse_overrides(path=None):

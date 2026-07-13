@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================
-# Alcove v1.3.0 — alcove.py
+# Alcove — alcove.py
 # Pre-flight diagnostics and launcher
 # Copyright (C) 2026 Robert Shea
 # This software is distributed as FREEWARE. Please refer to the readme.txt file for more information.
@@ -24,6 +24,13 @@ if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.b
 
 import ssl
 import subprocess
+import time
+import urllib.request
+
+if os.name == "nt":
+    os.environ.setdefault("PYTHONUTF8", "1")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import importlib
 
@@ -31,7 +38,9 @@ import certifi
 
 config = None  # loaded dynamically after check_config_exists()
 
-LOGO = r"""
+VERSION = "2.0.0"
+
+LOGO = rf"""
     _    _     ____ _____     _______
    / \  | |   / ___/ _ \ \   / / ____|
   / _ \ | |  | |  | | | \ \ / /|  _|
@@ -39,7 +48,7 @@ LOGO = r"""
 /_/   \_\_____\____\___/  \_/  |_____|
      Your Companion's Private Space
 
-Version 1.3.0 by Rob   
+Version {VERSION} by Rob   
 Copyright (C) 2026
 This software may not be used, copied, modified, or distributed without express permission from the author.
 """
@@ -121,18 +130,16 @@ def check_optional_models():
     return True
 
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def check_config_exists():
     global config
     print("\n-- Config file --")
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "config.py")
+    config_path = os.path.join(_PROJECT_ROOT, "config.py")
     if os.path.isfile(config_path):
         _ok("config.py found")
-        # Ensure the script's directory is on sys.path so `import config`
-        # resolves to the local config.py regardless of cwd or how the
-        # launcher was invoked (works even if the path contains spaces).
-        if script_dir not in sys.path:
-            sys.path.insert(0, script_dir)
+        if _PROJECT_ROOT not in sys.path:
+            sys.path.insert(0, _PROJECT_ROOT)
         config = importlib.import_module("config")
         return True
     else:
@@ -187,6 +194,27 @@ def check_ssl():
     return True
 
 
+def check_for_update():
+    try:
+        ctx = ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE", certifi.where()))
+        remote_version = urllib.request.urlopen(
+            "https://cubeebuc.s3.amazonaws.com/alcove/releases/current.txt",
+            context=ctx,
+            timeout=5,
+        ).read().decode("utf-8").strip()
+        local_int = int(VERSION.replace(".", ""))
+        remote_int = int(remote_version.replace(".", ""))
+        if remote_int > local_int:
+            print()
+            print("=" * 60)
+            print(f"  NEW RELEASE AVAILABLE — v{remote_version}")
+            print(f"  Download at: https://ai-alcove.neocities.org/")
+            print("=" * 60)
+            time.sleep(5)
+    except Exception:
+        pass
+
+
 def main():
     print(LOGO)
     print("\nRunning pre-flight diagnostics...")
@@ -222,13 +250,14 @@ def main():
         print("Pre-flight checks FAILED. Fix the issues above before launching.")
         sys.exit(1)
 
+    check_for_update()
+
     print("All pre-flight checks passed. Launching main.py...\n")
     sys.stdout.flush()
-    script_dir = os.path.dirname(os.path.abspath(__file__))
 
     # Run the bot via `python -m modules.main` so relative imports inside
     # the modules/ package work correctly. The CWD is set to the project
-    # root so that config.py, companion_data.db, and data directories are
+    # root so that config.py, databases/, and data directories are
     # found regardless of how alcove.py was invoked.
     # On Windows we avoid os.execv: the MS C runtime re-quotes arguments in a
     # way that mangles paths containing spaces (a long-standing CPython issue),
@@ -238,13 +267,13 @@ def main():
         try:
             completed = subprocess.run(
                 [sys.executable, "-u", "-m", "modules.main"],
-                cwd=script_dir,
+                cwd=_PROJECT_ROOT,
             )
         except KeyboardInterrupt:
             sys.exit(130)
         sys.exit(completed.returncode)
     else:
-        os.chdir(script_dir)
+        os.chdir(_PROJECT_ROOT)
         os.execv(sys.executable, [sys.executable, "-u", "-m", "modules.main"])
 
 

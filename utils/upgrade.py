@@ -10,7 +10,7 @@
 #   2. Validates that it looks like a real Alcove install.
 #   3. Copies personal files into this (new) directory:
 #        - config.py
-#        - companion_data.db
+#        - databases/companion_data.db
 #        - companion_datafiles/  (entire folder)
 #   4. Backs up the freshly copied config.py.
 #   5. Merges new config_template.py settings into config.py,
@@ -35,20 +35,28 @@ if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.b
         os.environ["PATH"] = os.path.join(_venv_dir, "bin") + os.pathsep + os.environ.get("PATH", "")
         os.execv(_venv_python, [_venv_python] + sys.argv)
 
-import re
 import shutil
 from datetime import datetime
 from pathlib import Path
 
+# Add project root and utils dir to sys.path so modules and other utils can be imported
+HERE = Path(__file__).parent.resolve()
+if HERE.name == "utils":
+    ROOT = HERE.parent
+else:
+    ROOT = HERE
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
 from modules.upgrade_config import collect_assignments, merge_config, parse_overrides
 
-HERE = Path(__file__).parent.resolve()
 TEMPLATE_PATH = HERE / "config_template.py"
-CONFIG_PATH = HERE / "config.py"
-OVERRIDES_PATH = HERE / "modules" / "upgrade_overrides.dat"
-DB_NAME = "companion_data.db"
+CONFIG_PATH = ROOT / "config.py"
+OVERRIDES_PATH = HERE / "upgrade_overrides.dat"
 DATAFILES_DIR = "companion_datafiles"
-TOOLS_DIR = "tools"
 
 # Python executable name for displaying example commands back to the user.
 # Uses the name of whatever interpreter is currently running this script
@@ -57,116 +65,25 @@ TOOLS_DIR = "tools"
 PY_CMD = Path(sys.executable).stem or "python"
 
 
-# ── Tool-location reconciliation ───────────────────────────────────────────
-
-def _tool_filenames(tools_dir):
-    """Return a set of .md filenames in a tools directory (just the names, not paths)."""
-    if not tools_dir.is_dir():
-        return set()
-    return {f.name for f in tools_dir.iterdir() if f.is_file() and f.suffix == ".md"}
-
-
-def _extract_tool_filename(entry_text):
-    """Given a source fragment like 'Path(__file__).parent / "tools/react.md"',
-    return just the filename portion ('react.md'), or None if unparseable."""
-    m = re.search(r'["\']tools/([^"\']+)["\']', entry_text)
-    return m.group(1) if m else None
-
-
-def reconcile_tool_locations(config_source, old_tools_dir, new_tools_dir):
-    """Adjust LOADED_TOOL_LOCATIONS in *config_source* based on which tool
-    files were removed or added between the old and new installs.
-
-    Returns (new_source, removed_list, added_list).
-    """
-    old_files = _tool_filenames(old_tools_dir)
-    new_files = _tool_filenames(new_tools_dir)
-
-    gone = old_files - new_files      # files that were removed / renamed away
-    fresh = new_files - old_files     # files that are brand-new in this release
-
-    if not gone and not fresh:
-        return config_source, [], []
-
-    # Locate the LOADED_TOOL_LOCATIONS list in the source via AST so we have
-    # exact line numbers, then do a text-level rewrite.
-    tree = ast.parse(config_source)
-    target_node = None
+def _is_location_var_empty(source, var_name):
+    """Return True if *var_name* is not defined in *source* or is set to an
+    empty string / empty list (i.e. the user relies on auto-discovery)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return True
     for node in tree.body:
         if (isinstance(node, ast.Assign)
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id == "LOADED_TOOL_LOCATIONS"):
-            target_node = node
-            break
-
-    if target_node is None:
-        return config_source, [], []
-
-    lines = config_source.splitlines(keepends=True)
-
-    # The list spans from target_node.value.lineno to target_node.value.end_lineno (1-based).
-    list_start = target_node.value.lineno - 1      # index into lines[]
-    list_end = target_node.value.end_lineno - 1
-
-    # Pull out the existing list lines and filter / augment.
-    list_lines = lines[list_start:list_end + 1]
-
-    # --- Remove entries whose tool file no longer exists ---
-    removed = []
-    kept_lines = []
-    for line in list_lines:
-        fname = _extract_tool_filename(line)
-        if fname and fname in gone:
-            removed.append(fname)
-        else:
-            kept_lines.append(line)
-
-    # --- Add entries for brand-new tool files ---
-    # Find the line just before the closing ']' so we can insert above it.
-    # Detect indentation from an existing entry for consistency.
-    indent = "        "  # fallback
-    for line in kept_lines:
-        if "tools/" in line:
-            indent = line[: len(line) - len(line.lstrip())]
-            break
-
-    added = []
-    # We insert new tools just before the closing bracket.
-    insert_before = len(kept_lines) - 1  # the ']' line
-
-    if fresh and insert_before > 0:
-        # The last real entry before ']' may lack a trailing comma (valid
-        # Python for the final element).  We need to add one before we
-        # insert new entries after it, or the result won't parse.
-        last_entry_idx = insert_before - 1
-        stripped = kept_lines[last_entry_idx].rstrip()
-        # Strip inline comment to find the actual code portion
-        code_part = stripped.split("#")[0].rstrip() if "#" in stripped else stripped
-        if code_part and not code_part.endswith(","):
-            # Insert a comma right after the code, preserving any comment
-            if "#" in stripped:
-                comment_start = stripped.index("#")
-                kept_lines[last_entry_idx] = (
-                    stripped[:comment_start].rstrip() + ","
-                    + "  " + stripped[comment_start:] + "\n"
-                )
-            else:
-                kept_lines[last_entry_idx] = stripped + ",\n"
-
-    for fname in sorted(fresh):
-        entry = f'{indent}Path(__file__).parent / "tools/{fname}",\n'
-        kept_lines.insert(insert_before, entry)
-        insert_before += 1
-        added.append(fname)
-
-    # Reassemble the source.
-    new_source = "".join(lines[:list_start] + kept_lines + lines[list_end + 1:])
-
-    # Sanity check — must still parse.
-    ast.parse(new_source)
-
-    return new_source, removed, added
+                and node.targets[0].id == var_name):
+            val = node.value
+            if isinstance(val, ast.Constant) and val.value == "":
+                return True
+            if isinstance(val, ast.List) and len(val.elts) == 0:
+                return True
+            return False
+    return True
 
 
 # ── Main upgrade flow ──────────────────────────────────────────────────────
@@ -181,7 +98,7 @@ def ask(prompt, default=None):
     return answer if answer else default
 
 
-def main():
+def _run_upgrade():
     print()
     print("=" * 56)
     print("  Alcove Upgrade Assistant")
@@ -206,8 +123,23 @@ def main():
         print(f"   Run this script from inside the NEW Alcove folder.")
         return 1
 
+    # ── 1b. List previous Alcove directories in parent folder ──
+    previous_alcove_dirs = []
+    parent_dir = ROOT.parent
+    if parent_dir.is_dir():
+        for entry in sorted(parent_dir.iterdir()):
+            if entry.is_dir() and entry != ROOT and (entry / "config.py").exists():
+                previous_alcove_dirs.append(entry)
+
+    if previous_alcove_dirs:
+        print()
+        print("   Previous Alcove directories found in parent folder:")
+        for d in previous_alcove_dirs:
+            print(f"      • {d}")
+        print()
+
     # ── 2. Ask for the old directory ──
-    old_path_str = ask("Enter the path to your PREVIOUS Alcove directory\n")
+    old_path_str = ask("Enter the path to your PREVIOUS Alcove directory you wish to upgrade from\n")
     if not old_path_str:
         print("❌ No path provided. Exiting.")
         return 1
@@ -215,11 +147,11 @@ def main():
     old_dir = Path(old_path_str).resolve()
 
     # Validate it's not the same directory
-    if old_dir == HERE:
+    if old_dir == ROOT:
         print()
         print("❌ That's the same directory as this one!")
         print("   The old Alcove directory must be a DIFFERENT folder.")
-        print(f"   This (new) directory: {HERE}")
+        print(f"   This (new) directory: {ROOT}")
         return 1
 
     # Validate it looks like an Alcove install
@@ -235,13 +167,13 @@ def main():
 
     # ── 2b. Check if the new directory is next to the old one ──
     old_parent = old_dir.parent
-    if HERE.parent != old_parent:
+    if ROOT.parent != old_parent:
         print()
         print(f"⚠  This new directory isn't next to your old install.")
         print(f"   Old install:  {old_dir}")
-        print(f"   Running from: {HERE}")
+        print(f"   Running from: {ROOT}")
         print()
-        expected_dest = old_parent / HERE.name
+        expected_dest = old_parent / ROOT.name
         if expected_dest.exists():
             print(f"❌ Cannot auto-relocate: {expected_dest} already exists.")
             print(f"   Remove or rename it first, or move this folder manually.")
@@ -251,9 +183,9 @@ def main():
             print()
             print("   Continuing from the current location. You can move it later.")
         else:
-            print(f"\n   Moving {HERE.name}/ → {old_parent}/ ... ", end="")
+            print(f"\n   Moving {ROOT.name}/ → {old_parent}/ ... ", end="")
             try:
-                shutil.copytree(HERE, expected_dest)
+                shutil.copytree(ROOT, expected_dest)
                 print("✅")
                 print()
                 print(f"   ✅ Copied to: {expected_dest}")
@@ -262,7 +194,7 @@ def main():
                 print(f"     cd \"{expected_dest}\"")
                 print(f"     {PY_CMD} upgrade.py")
                 print()
-                print(f"   (You can delete {HERE} after confirming the new location works.)")
+                print(f"   (You can delete {ROOT} after confirming the new location works.)")
                 return 0
             except Exception as e:
                 print(f"❌")
@@ -272,15 +204,16 @@ def main():
 
     print()
     print(f"   Old directory: {old_dir}")
-    print(f"   New directory: {HERE}")
+    print(f"   New directory: {ROOT}")
     print()
 
     # ── 2c. Ensure companion_datafiles/ auto-discovery subdirectories exist ──
-    # Create these in the NEW install BEFORE the copy. The companion_datafiles
-    # copy below uses dirs_exist_ok=True so old files are merged in on top of
-    # these pre-created subdirs rather than wiping them. main.py's periodic
-    # auto-discovery then populates the matching config variables from
-    # whatever the user drops into each folder.
+    # Create the default/ profile directory and its auto-discovery subdirs in
+    # the NEW install BEFORE the copy. The companion_datafiles copy below uses
+    # dirs_exist_ok=True so old files are merged in on top of these pre-created
+    # subdirs rather than wiping them. main.py's periodic auto-discovery then
+    # populates the matching config variables from whatever the user drops into
+    # each folder.
     print("── Ensuring auto-discovery subdirectories ──")
     AUTO_DISCOVER_SUBDIRS = [
         "1_system_prompt",
@@ -289,15 +222,21 @@ def main():
         "4_context_reference",
         "5_search_reference",
     ]
-    new_datafiles_pre = HERE / DATAFILES_DIR
+    new_datafiles_pre = ROOT / DATAFILES_DIR
     new_datafiles_pre.mkdir(exist_ok=True)
+    default_dir = new_datafiles_pre / "default"
+    if default_dir.is_dir():
+        print(f"   {DATAFILES_DIR}/default/ ... ✅ exists")
+    else:
+        default_dir.mkdir(parents=True, exist_ok=True)
+        print(f"   {DATAFILES_DIR}/default/ ... ➕ created")
     for sub in AUTO_DISCOVER_SUBDIRS:
-        sub_path = new_datafiles_pre / sub
+        sub_path = default_dir / sub
         if sub_path.is_dir():
-            print(f"   {DATAFILES_DIR}/{sub}/ ... ✅ exists")
+            print(f"   {DATAFILES_DIR}/default/{sub}/ ... ✅ exists")
         else:
             sub_path.mkdir(parents=True, exist_ok=True)
-            print(f"   {DATAFILES_DIR}/{sub}/ ... ➕ created")
+            print(f"   {DATAFILES_DIR}/default/{sub}/ ... ➕ created")
     print()
 
     # ── 3. Copy personal files ──
@@ -310,29 +249,91 @@ def main():
     print("✅")
     files_copied += 1
 
-    # companion_data.db
-    old_db = old_dir / DB_NAME
-    if old_db.exists():
-        print(f"   {DB_NAME} ... ", end="")
-        shutil.copy2(old_db, HERE / DB_NAME)
-        print(f"✅ ({old_db.stat().st_size / 1024:.0f} KB)")
-        files_copied += 1
+    # databases/ — copy the entire tree (all companion DBs + registry.db).
+    # Excludes search_vectors_data/ (vector stores rebuild on startup) and
+    # hidden files like .DS_Store.
+    old_dbs_dir = old_dir / "databases"
+    if old_dbs_dir.is_dir():
+        (ROOT / "databases").mkdir(exist_ok=True)
+        print(f"   databases/ ... ", end="")
+
+        def _ignore_dbs_tree(directory, contents):
+            return [c for c in contents
+                    if c == "search_vectors_data" or c.startswith(".")]
+
+        shutil.copytree(old_dbs_dir, ROOT / "databases",
+                        dirs_exist_ok=True, ignore=_ignore_dbs_tree)
+        db_count = sum(1 for p in (ROOT / "databases").rglob("*.db") if p.is_file())
+        if db_count:
+            print(f"✅ ({db_count} database file(s))")
+            files_copied += 1
+        else:
+            print("⬜ (no .db files found)")
     else:
-        print(f"   {DB_NAME} ... ⬜ not found (starting fresh)")
+        # Pre-2.0 layout: companion_data.db lived at the install root
+        old_root_db = old_dir / "companion_data.db"
+        if old_root_db.exists():
+            (ROOT / "databases").mkdir(exist_ok=True)
+            dest = ROOT / "databases" / "companion_data.db"
+            print(f"   databases/companion_data.db ... ", end="")
+            shutil.copy2(old_root_db, dest)
+            print(f"✅ ({old_root_db.stat().st_size / 1024:.0f} KB)")
+            files_copied += 1
+        else:
+            print(f"   databases/ ... ⬜ not found (starting fresh)")
 
     # companion_datafiles/
     old_datafiles = old_dir / DATAFILES_DIR
-    new_datafiles = HERE / DATAFILES_DIR
+    new_datafiles = ROOT / DATAFILES_DIR
     if old_datafiles.is_dir():
         print(f"   {DATAFILES_DIR}/ ... ", end="")
-        # Count files for reporting
         file_count = sum(1 for _ in old_datafiles.rglob("*") if _.is_file())
-        # Merge old files into the (already-created) new datafiles tree so
-        # the auto-discovery subdirs created above survive. dirs_exist_ok=True
-        # requires Python 3.8+.
-        shutil.copytree(old_datafiles, new_datafiles, dirs_exist_ok=True)
+
+        # Determine which top-level auto-discovery folders to divert into
+        # default/ instead of copying to the root of companion_datafiles/.
+        LOCATION_VAR_TO_FOLDER = {
+            "SYSTEM_PROMPT_LOCATION": "1_system_prompt",
+            "INSTRUCTION_LOCATIONS": "2_secondary_instructions",
+            "CONTEXT_HISTORY_LOCATIONS": "3_context_history",
+            "CONTEXT_REFERENCE_LOCATIONS": "4_context_reference",
+            "SEARCH_REFERENCE_LOCATIONS": "5_search_reference",
+        }
+        old_config_src = old_config.read_text()
+        divert_folders = set()
+        for var_name, folder_name in LOCATION_VAR_TO_FOLDER.items():
+            if _is_location_var_empty(old_config_src, var_name):
+                divert_folders.add(folder_name)
+
+        def _ignore_top_auto_discovery(directory, contents):
+            if directory == str(old_datafiles):
+                return [c for c in contents if c in divert_folders]
+            return []
+
+        shutil.copytree(old_datafiles, new_datafiles, dirs_exist_ok=True,
+                        ignore=_ignore_top_auto_discovery)
         print(f"✅ ({file_count} files)")
         files_copied += 1
+
+        # Copy diverted auto-discovery folders into default/ instead.
+        migrated = []
+        for folder_name in sorted(divert_folders):
+            src_folder = old_datafiles / folder_name
+            dst_folder = new_datafiles / "default" / folder_name
+            if not src_folder.is_dir():
+                continue
+            src_file_count = sum(1 for _ in src_folder.rglob("*") if _.is_file())
+            if src_file_count == 0:
+                continue
+            shutil.copytree(src_folder, dst_folder, dirs_exist_ok=True)
+            migrated.extend(
+                f"default/{folder_name}/{f.relative_to(src_folder)}"
+                for f in src_folder.rglob("*")
+                if f.is_file()
+            )
+        if migrated:
+            print(f"   → {len(migrated)} auto-discovered file(s) diverted into {DATAFILES_DIR}/default/:")
+            for f in migrated:
+                print(f"      → {f}")
     else:
         print(f"   {DATAFILES_DIR}/ ... ⬜ not found (using defaults)")
 
@@ -343,10 +344,10 @@ def main():
     print("── Merging config settings ──")
 
     stamp = datetime.now().strftime("%Y%m%d")
-    backup_path = HERE / f"config_backup_{stamp}.py"
+    backup_path = ROOT / f"config_backup_{stamp}.py"
     if backup_path.exists():
         stamp_full = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = HERE / f"config_backup_{stamp_full}.py"
+        backup_path = ROOT / f"config_backup_{stamp_full}.py"
     shutil.copy2(CONFIG_PATH, backup_path)
     print(f"   📦 Config backup: {backup_path.name}")
 
@@ -375,29 +376,6 @@ def main():
         print(f"      config.py is unchanged. Backup: {backup_path.name}")
         return 1
 
-    # ── 5b. Reconcile LOADED_TOOL_LOCATIONS ──
-    old_tools = old_dir / TOOLS_DIR
-    new_tools = HERE / TOOLS_DIR
-    tools_removed = []
-    tools_added = []
-    print()
-    print(f"   Old tools dir: {old_tools}  (exists: {old_tools.is_dir()})")
-    print(f"   New tools dir: {new_tools}  (exists: {new_tools.is_dir()})")
-    if old_tools.is_dir() or new_tools.is_dir():
-        try:
-            old_set = _tool_filenames(old_tools)
-            new_set = _tool_filenames(new_tools)
-            print(f"   Old tool files: {sorted(old_set)}")
-            print(f"   New tool files: {sorted(new_set)}")
-            print(f"   Gone (in old, not new): {sorted(old_set - new_set)}")
-            print(f"   Fresh (in new, not old): {sorted(new_set - old_set)}")
-            new_source, tools_removed, tools_added = reconcile_tool_locations(
-                new_source, old_tools, new_tools
-            )
-        except Exception as e:
-            print(f"   ⚠  Tool location reconciliation failed: {e}")
-            print(f"      LOADED_TOOL_LOCATIONS left as-is; review it manually.")
-
     CONFIG_PATH.write_text(new_source)
 
     print()
@@ -420,18 +398,6 @@ def main():
         for n in report["removed"]:
             print(f"          ? {n}")
         print("      These were dropped from config.py but remain in your backup.")
-
-    if tools_removed or tools_added:
-        print()
-        print("   🔧 LOADED_TOOL_LOCATIONS updated:")
-        for t in tools_removed:
-            print(f"          − {t}  (removed — no longer in tools/)")
-        for t in tools_added:
-            print(f"          + {t}  (new tool)")
-        if tools_removed:
-            print("      Removed tools were renamed or retired. Check the release")
-            print("      notes if you relied on one — the replacement may already")
-            print("      be in the added list above.")
 
     # ── 6. Install / verify Python dependencies ──
     print()
@@ -462,7 +428,7 @@ def main():
         print(f"       {PY_CMD} install_deps.py")
         print()
     print("  2. Start Alcove from THIS directory and note any errors or failures:")
-    print(f"       {PY_CMD} alcove.py")
+    print(f"       {PY_CMD} modules/alcove.py")
     print()
     print("  3. Inside of your companion's Discord, run !diag in any channel to verify everything is working.")
     print()
@@ -473,6 +439,16 @@ def main():
     print(f"  Config backup: {backup_path.name}")
     print()
     return 0
+
+
+def main():
+    try:
+        return _run_upgrade()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        print("Cancelled by user.")
+        print()
+        return 130
 
 
 if __name__ == "__main__":

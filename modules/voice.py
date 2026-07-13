@@ -1,5 +1,5 @@
 # ============================================
-# Alcove v1.3.0 — voice.py
+# Alcove — voice.py
 # Voice channel management and TTS/STT
 # Copyright (C) 2026 Robert Shea
 # This software is distributed as FREEWARE. Please refer to the readme.txt file for more information.
@@ -7,10 +7,43 @@
 import aiohttp
 import asyncio
 import discord
-import os
-import subprocess
-import tempfile
 from config import ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_VOICE_MODEL
+from .voice_utils import mp3_to_pcm, play_pcm_on_voice_client
+
+_ELEVENLABS_TIMEOUT = aiohttp.ClientTimeout(total=120)
+
+
+async def get_elevenlabs_subscription():
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.get(
+                "https://api.elevenlabs.io/v1/user/subscription",
+                headers={"xi-api-key": ELEVENLABS_API_KEY},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    used = int(data.get("character_count", 0))
+                    limit = int(data.get("character_limit", 0))
+                    remaining = max(limit - used, 0)
+                    tier = data.get("tier", "?")
+                    return {
+                        "tier": tier,
+                        "used": used,
+                        "limit": limit,
+                        "remaining": remaining,
+                        "error": None,
+                    }
+                else:
+                    body = (await resp.text())[:120]
+                    return {
+                        "tier": None, "used": 0, "limit": 0, "remaining": 0,
+                        "error": f"error {resp.status} — {body}",
+                    }
+    except Exception as e:
+        return {
+            "tier": None, "used": 0, "limit": 0, "remaining": 0,
+            "error": f"request failed — {e}",
+        }
 
 # ============================================
 # TEXT TO SPEECH (ElevenLabs)
@@ -37,7 +70,7 @@ async def text_to_speech(text, voice_id=None):
         }
     }
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=_ELEVENLABS_TIMEOUT) as session:
         async with session.post(url, headers=headers, json=payload) as response:
             if response.status == 200:
                 audio_bytes = await response.read()
@@ -69,9 +102,10 @@ async def speech_to_text(audio_bytes, filename="audio.ogg"):
     }.get(ext, "audio/ogg")
     form = aiohttp.FormData()
     form.add_field("file", audio_bytes, filename=filename, content_type=content_type)
-    form.add_field("model_id", "scribe_v1")
+    form.add_field("model_id", "scribe_v2")
+    form.add_field("tag_audio_events", "true")
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=_ELEVENLABS_TIMEOUT) as session:
         async with session.post(url, headers=headers, data=form) as response:
             if response.status == 200:
                 data = await response.json()
@@ -80,34 +114,6 @@ async def speech_to_text(audio_bytes, filename="audio.ogg"):
                 error = await response.text()
                 print(f"⚠️ ElevenLabs STT error {response.status}: {error[:300]}")
                 return None
-
-# ============================================
-# AUDIO FORMAT CONVERSION
-# ============================================
-def mp3_to_pcm(mp3_bytes):
-    # Convert mp3 bytes to PCM audio using ffmpeg (for discord.py voice playback).
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_in:
-        tmp_in.write(mp3_bytes)
-        tmp_in_path = tmp_in.name
-
-    tmp_out_path = tmp_in_path.replace(".mp3", ".wav")
-
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", tmp_in_path, "-f", "wav",
-             "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2",
-             tmp_out_path],
-            capture_output=True, check=True
-        )
-        with open(tmp_out_path, "rb") as f:
-            return f.read()
-    except subprocess.CalledProcessError as e:
-        print(f"⚠️ ffmpeg error: {e.stderr.decode()[:300]}")
-        return None
-    finally:
-        os.unlink(tmp_in_path)
-        if os.path.exists(tmp_out_path):
-            os.unlink(tmp_out_path)
 
 # ============================================
 # VOICE CHANNEL MANAGEMENT
@@ -119,38 +125,77 @@ class VoiceManager:
         self.voice_client = None
 
     async def join(self, channel):
-        # Join a voice channel. Returns True on success.
         try:
-            if self.voice_client and self.voice_client.is_connected():
+            guild_vc = channel.guild.voice_client
+
+            if guild_vc and guild_vc.is_connected():
+                self.voice_client = guild_vc
                 if self.voice_client.channel == channel:
-                    return True  # Already in this channel
+                    return True
+                try:
+                    await self.voice_client.move_to(channel)
+                except Exception:
+                    await guild_vc.disconnect(force=True)
+                    self.voice_client = None
+                    self.voice_client = await channel.connect()
+
+            elif guild_vc and not guild_vc.is_connected():
+                await guild_vc.disconnect(force=True)
+                self.voice_client = None
+                self.voice_client = await channel.connect()
+
+            elif self.voice_client and self.voice_client.is_connected():
+                if self.voice_client.channel == channel:
+                    return True
                 await self.voice_client.move_to(channel)
+
             else:
                 self.voice_client = await channel.connect()
-            print(f"🔊 Joined voice channel: {channel.name}")
-            return True
+
+        except discord.ClientException as e:
+            if "Already connected" in str(e):
+                guild_vc = channel.guild.voice_client
+                if guild_vc:
+                    await guild_vc.disconnect(force=True)
+                self.voice_client = None
+                self.voice_client = await channel.connect()
+            else:
+                import traceback
+                print(f"⚠️ Failed to join voice channel: {e}")
+                traceback.print_exc()
+                return False
         except Exception as e:
             import traceback
             print(f"⚠️ Failed to join voice channel: {e}")
             traceback.print_exc()
             return False
+        print(f"🔊 Joined voice channel: {channel.name}")
+        return True
 
-    async def leave(self):
-        # Leave the current voice channel.
-        if self.voice_client and self.voice_client.is_connected():
-            channel_name = self.voice_client.channel.name
-            await self.voice_client.disconnect()
+    async def leave(self, guild=None):
+        guild_vc = guild.voice_client if guild else None
+        vc = self.voice_client if (self.voice_client and self.voice_client.is_connected()) else guild_vc
+        if vc:
+            channel_name = getattr(vc.channel, 'name', 'unknown')
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
             self.voice_client = None
             print(f"🔇 Left voice channel: {channel_name}")
             return True
+        self.voice_client = None
         return False
 
-    def is_connected(self):
-        # Check if the bot is currently in a voice channel.
-        return self.voice_client is not None and self.voice_client.is_connected()
+    def is_connected(self, guild=None):
+        if self.voice_client and self.voice_client.is_connected():
+            return True
+        if guild and guild.voice_client and guild.voice_client.is_connected():
+            self.voice_client = guild.voice_client
+            return True
+        return False
 
     async def play_audio(self, mp3_bytes):
-        # Convert mp3 to PCM and play it in the voice channel.
         if not self.is_connected():
             print("⚠️ Not connected to a voice channel")
             return False
@@ -159,36 +204,7 @@ class VoiceManager:
         if wav_bytes is None:
             return False
 
-        # Write wav to a temp file for FFmpegPCMAudio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(wav_bytes)
-            tmp_path = tmp.name
-
-        try:
-            # Wait for any current audio to finish
-            while self.voice_client.is_playing():
-                await asyncio.sleep(0.1)
-
-            # Play the audio
-            audio_source = discord.FFmpegPCMAudio(tmp_path)
-            done_event = asyncio.Event()
-
-            def after_playing(error):
-                if error:
-                    print(f"⚠️ Playback error: {error}")
-                # Schedule cleanup on the event loop
-                done_event.set()
-
-            self.voice_client.play(audio_source, after=after_playing)
-            # Wait for playback to complete before cleaning up the temp file
-            await done_event.wait()
-        finally:
-            # Small delay to ensure file handle is released
-            await asyncio.sleep(0.2)
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-
-        return True
+        return await play_pcm_on_voice_client(self.voice_client, wav_bytes)
 
 # Singleton instance
 voice_manager = VoiceManager()

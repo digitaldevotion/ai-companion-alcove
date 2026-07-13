@@ -1,10 +1,10 @@
 # ai-companion-alcove
 
-A Discord-based engine (in Python) designed for platform-independent interactions with AI companions via APIs. It pairs a feature-rich system with precision-controlled context memory, user-defined macros, model / provider flexibility (supports OpenRouter and NanoGPT), and per-channel customization to create a robust and highly accessible living space for your AI companion to thrive in.
+Alcove is a Discord-based engine (in Python) designed for platform-independent interactions with AI companions via APIs. It pairs a feature-rich system with precision-controlled context memory, user-defined macros, model / provider flexibility (supports OpenRouter and NanoGPT), and per-channel customization to create a robust and highly accessible living space for your AI companion to thrive in.
 
 ## Documentation and Software Releases
 
-The latest documentation and software are available here: [AI Alcove](https://www.google.com/search?q=https://ai-alcove.neocities.org/)
+The latest documentation and software are available here: [AI Alcove](https://ai-alcove.neocities.org/)
 
 ---
 
@@ -12,35 +12,44 @@ The latest documentation and software are available here: [AI Alcove](https://ww
 
 Everything your companion needs to feel at home:
 
-### 💬 Conversations & Interaction
+- **Separate Channel Conversations** — Each Discord channel is its own conversation space with independent session/chat history, channel specific context loaded files, and more! Each channel can have its own companion assignment, too!
 
-* **Channel Conversations:** Each Discord channel is its own conversation space with independent chat history, model assignments, and context settings.
-* **Voice Conversations:** Push-to-talk voice support via ElevenLabs. Your companion joins voice channels, listens, and speaks its responses aloud.
-* **Image Generation & Vision:** Generate images inline from chat. Your companion can also view images you share, powered by multimodal models.
-* **Companion Reactions:** Your companion can add emoji reactions to your messages, bringing more personality and expressiveness to conversations.
-* **Export Chats:** Export chats on-demand to the filesystem or directly attached to the current conversation — archive and share your companion's conversations effortlessly.
+- **Dynamic Customization** — Per-channel model assignments, reasoning levels, temperature, topK, and knowledge+search inclusion, all adjustable on the fly. Optionally reveal your companion's thinking process, and lock a preferred provider for prompt caching benefits.
 
-### 🧠 Memory & Context Management
+- **Anchored Memories** — Anchored memories stay in context until you remove them. Created by you or automatically by your companion. Memories can be specific to a channel or global across all channels assigned to that companion. Anchored memories may be exported at any time.
 
-* **Persistent Memory:** Global and channel-specific anchored memories stay in context until you remove them. Created manually by you or automatically by your companion. Your companion remembers what matters.
-* **Cross-Channel Context:** Copy context from one channel to another and back again — carry a discussion seamlessly across text, voice, and other channels without losing the thread.
-* **Token-Aware Context:** Dynamic token budgeting trims oldest messages first while preserving knowledge files. Smart context, not arbitrary turn limits.
-* **Regenerate & Resubmit:** Regenerate responses or replace and resubmit prompts on the fly — just like popular GPT clients.
+- **Session Journaling** — Take yourself out of the manual journal maintenance. Ask your companion to summarize your time together and write it to an internal journal. Older entries are automatically archived to your search directory. Number of journal entries in context and journaling detail prompt are user configurable!
 
-### 📚 Knowledge & Search
+- **Image Generation & Vision** — Generate images inline from chat, with optional reference images to guide the result. Your companion can also view images you share, powered by multimodal models.
 
-* **Fusion Search:** A hybrid search algorithm that combines keyword precision with semantic recall. Smart neighbor recovery stitches together text split across chunk boundaries, and dynamic budgeting scales results to fill available context.
-* **Auto-Loading Datafile Directories:** Drop text files related to your companion into the right folders and Alcove picks them up automatically — no manual path configurations required.
-* **Dynamic Specialty Knowledge:** Dynamically load specialty knowledge files into context for a specific session or Discord channel — bring in exactly the expertise you need, when you need it.
+- **Companion Reactions** — Your companion can add emoji reactions to your messages, bringing more personality and expressiveness to conversations.
 
-### ⚙️ Customization, Models & Logic
+- **Drag and Drop Companion Datafile Directories** — Drop text files into the right folders and Alcove picks them up automatically! No manual path configuration required. On-demand file loading with clear error feedback if anything goes wrong.
 
-* **Dynamic Customization:** Per-channel LLM model assignments, context window limits, reasoning levels, and knowledge inclusion — all adjustable on the fly.
-* **Model Agnostic:** Built on OpenRouter or NanoGPT — swap between Claude, GPT, Gemini, or any supported model for text and image generation.
-* **Macros:** Save frequently used prompts or Alcove commands as macros and execute them instantly — streamline your workflow.
-* **Call Chaining:** Your companion can now perform multiple tool steps — web searches, command callouts (if enabled), and more — to complete a task.
+- **Dynamic Specialty Knowledge** — Dynamically load specialty knowledge files into context for a specific session or Discord channel! Bring in exactly the knowledge or expertise you need, when you need it.
 
-### 🔒 Transparency & Control
+- **Macros** — Create shortcuts to up to 50 frequently used prompts or Alcove commands as macros and execute them instantly, streamline your workflow.
 
-* **Usage Transparency:** On-the-fly OpenRouter, NanoGPT, and ElevenLabs usage details, context window estimates, and more — straight from Discord.
-* **Minimal Guardrails:** Consumer-level prompt enforcement and safe completions are minimized through direct API access. A more natural conversation.
+- **Voice Conversations** — Push-to-talk voice with enhanced recognition that detects sighs, laughs, and other human sounds. Your companion can have a voice conversation with you in any channel. Your spoken words appear in chat before your companion responds.
+
+- **Multi-Companion Support** — If you have more than one companion, each one can be assigned to one or more distinct channels. Switch between companions instantly.
+
+- **Idle Actions & Dreams** — Allow your companion to reflect, take some actions, and dream while you're away from the keyboard. Uses BOTH session history and accessible knowledge in weaving their writing together. Schedules, frequency, and action prompts are user-configurable.
+
+- **Fusion Search** — A hybrid search blending keyword precision with semantic understanding, with improved caching for faster results. Split text is automatically stitched back together, and configurable limits keep search results from overwhelming your context window.
+
+- **Export Chats & Memories** — Export chats or anchored memories on-demand to the filesystem — or attach them directly to the current Discord channel. Archive and share your companion's conversations and memories effortlessly.
+
+- **Regenerate & Resubmit** — Regenerate responses or replace and resubmit prompts on the fly — just like popular GPT clients.
+
+- **Call Chaining** — Your companion can perform multiple tool steps — web searches, command callouts, and more to complete a task.
+
+- **Token-Aware Context** — Smart context management that preserves knowledge files while trimming older messages — with an adaptive safety margin that scales to your model's context window. No arbitrary turn limits.
+
+- **Model Agnostic** — Built on OpenRouter or NanoGPT — swap between Claude, GPT, Gemini, or any supported model for text and image generation.
+
+- **Channel Copying** — Copy context and settings from one channel to another and back again — carry a discussion seamlessly across text, voice, and other channels without losing the thread.
+
+- **Usage Transparency** — On-the-fly OpenRouter, NanoGPT, and ElevenLabs usage details, context window estimates, and more — straight from Discord.
+
+- **Minimal Guardrails** — Direct API access means fewer enforced prompts and restrictions — resulting in more natural, less constrained conversations.

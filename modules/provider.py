@@ -1,5 +1,5 @@
 # ============================================
-# Alcove v1.3.0 — provider.py
+# Alcove — provider.py
 # LLM provider abstraction layer
 # Copyright (C) 2026 Robert Shea
 # This software is distributed as FREEWARE. Please refer to the readme.txt file for more information.
@@ -15,11 +15,12 @@ import re
 
 import aiohttp
 import config
+from .utils import update_token_calibration
 
 
 # Generous ceiling — reasoning models (adaptive thinking, long tool rounds)
 # can legitimately take a while. We'd rather wait than kill a live request.
-# Bumped past discord.py's internal typing refresh so a stuck upstream still
+# Bumped past pycord's internal typing refresh so a stuck upstream still
 # surfaces as an error instead of hanging the message handler forever.
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=300)
 
@@ -52,9 +53,13 @@ def _extract_error_detail(data):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def get_provider():
+    return getattr(config, "PROVIDER", "openrouter").lower()
+
+
 def _api_key():
     """Return the API key for the active provider."""
-    provider = getattr(config, "PROVIDER", "openrouter").lower()
+    provider = get_provider()
     if provider == "nanogpt":
         return getattr(config, "NANOGPT_KEY", "")
     return config.OPENROUTER_KEY
@@ -62,7 +67,7 @@ def _api_key():
 
 def _base_url():
     """Return the base API URL for the active provider."""
-    provider = getattr(config, "PROVIDER", "openrouter").lower()
+    provider = get_provider()
     if provider == "nanogpt":
         return "https://nano-gpt.com/api/v1"
     return "https://openrouter.ai/api/v1"
@@ -70,7 +75,7 @@ def _base_url():
 
 def _headers():
     """Return the common HTTP headers for the active provider."""
-    provider = getattr(config, "PROVIDER", "openrouter").lower()
+    provider = get_provider()
     headers = {
         "Authorization": f"Bearer {_api_key()}",
         "Content-Type": "application/json",
@@ -88,7 +93,7 @@ def _auth_headers():
 
 def provider_name():
     """Return a human-friendly label for the active provider."""
-    provider = getattr(config, "PROVIDER", "openrouter").lower()
+    provider = get_provider()
     return {"openrouter": "OpenRouter", "nanogpt": "nanoGPT"}.get(provider, provider)
 
 
@@ -108,7 +113,7 @@ def normalize_model_id(model_id):
     """
     if not model_id:
         return model_id
-    prov = getattr(config, "PROVIDER", "openrouter").lower()
+    prov = get_provider()
     if prov != "nanogpt":
         return model_id
     if model_id.lower().startswith("nano-gpt/"):
@@ -116,10 +121,91 @@ def normalize_model_id(model_id):
     return model_id
 
 
+def _has_multimodal_content(messages):
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") in ("image_url", "input_audio"):
+                    return True
+    return False
+
+
+def _is_explicit_caching_model(model):
+    """
+    Return True if the model uses explicit cache_control breakpoints
+    (Anthropic, Alibaba/Qwen, Google/Gemini). All other models on
+    OpenRouter use implicit prefix caching, which is disrupted by
+    cache_control markers in the payload.
+    """
+    if not model:
+        return False
+    m = model.lower()
+    if m.startswith("claude-") or "anthropic/" in m:
+        return True
+    if m.startswith("qwen/") or "alibaba/" in m:
+        return True
+    if m.startswith("google/") or "gemini/" in m:
+        return True
+    return False
+
+
+def _sanitize_messages(messages, model, provider):
+    """
+    Remove "cache_control" from message content structures unless the
+    model supports explicit caching breakpoints.
+
+    Explicit-caching models (Anthropic, Alibaba/Qwen, Google/Gemini)
+    on OpenRouter need cache_control markers. All other OpenRouter
+    models use implicit prefix caching — cache_control markers can
+    interfere with implicit caching on these models.
+
+    On nanoGPT, cache_control is always stripped because nanoGPT uses
+    body-level promptCaching/caching helpers instead of inline markers,
+    and having both could exceed the 4-breakpoint limit.
+    """
+    if not messages:
+        return messages
+
+    is_nanogpt = provider == "nanogpt"
+
+    if not is_nanogpt and _is_explicit_caching_model(model):
+        return messages
+
+    sanitized = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            sanitized.append(msg)
+            continue
+
+        msg_copy = dict(msg)
+        content = msg_copy.get("content")
+
+        if isinstance(content, list):
+            block_list = []
+            for block in content:
+                if isinstance(block, dict):
+                    block_copy = dict(block)
+                    block_copy.pop("cache_control", None)
+                    block_list.append(block_copy)
+                else:
+                    block_list.append(block)
+            msg_copy["content"] = block_list
+        elif isinstance(content, dict):
+            content_copy = dict(content)
+            content_copy.pop("cache_control", None)
+            msg_copy["content"] = content_copy
+
+        sanitized.append(msg_copy)
+
+    return sanitized
+
+
 # ── Chat Completions ─────────────────────────────────────────────────────────
 
 async def chat_completion(model, messages, temperature=None, max_tokens=0,
-                          reasoning=None, modalities=None):
+                          reasoning=None, modalities=None, top_k=None,
+                          channel_key=None, provider_lock=None):
     """
     Send a chat completion request and return the raw JSON response dict.
 
@@ -130,17 +216,39 @@ async def chat_completion(model, messages, temperature=None, max_tokens=0,
     if temperature is None:
         temperature = config.TEMPERATURE
 
+    if top_k is None:
+        top_k = getattr(config, "TOP_K", 0)
+
+    prov = get_provider()
     payload = {
         "model": normalize_model_id(model),
-        "messages": messages,
+        "messages": _sanitize_messages(messages, model, prov),
         "temperature": temperature,
     }
+    if top_k and top_k > 0:
+        payload["top_k"] = top_k
     if max_tokens and max_tokens > 0:
         payload["max_tokens"] = max_tokens
     if reasoning and reasoning.lower() != "off":
         payload["reasoning"] = {"effort": reasoning.lower()}
+        if prov == "openrouter":
+            payload["include_reasoning"] = True
     if modalities:
         payload["modalities"] = modalities
+
+    is_anthropic = "anthropic/" in model.lower() or model.lower().startswith("claude-")
+
+    if prov == "nanogpt":
+        if is_anthropic:
+            payload["promptCaching"] = {"enabled": True, "ttl": "5m", "explicitCacheControl": True}
+        else:
+            payload["caching"] = True
+
+    if prov == "openrouter" and channel_key:
+        payload["session_id"] = channel_key
+
+    if provider_lock:
+        payload["provider"] = {"order": [provider_lock]}
 
     try:
         async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
@@ -156,7 +264,18 @@ async def chat_completion(model, messages, temperature=None, max_tokens=0,
                     return {"error": True, "status": response.status,
                             "detail": body_text[:500] or response.reason or "no body"}
                 try:
-                    return json.loads(body_text)
+                    res_data = json.loads(body_text)
+                    usage = res_data.get("usage")
+                    if usage and isinstance(usage, dict) and channel_key:
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        if prompt_tokens and prompt_tokens > 0:
+                            if not _has_multimodal_content(messages):
+                                msg_bytes = sum(
+                                    len(json.dumps(m).encode("utf-8"))
+                                    for m in _sanitize_messages(messages, model, prov)
+                                )
+                                update_token_calibration(channel_key, msg_bytes, prompt_tokens)
+                    return res_data
                 except (json.JSONDecodeError, ValueError) as e:
                     return {"error": True, "status": response.status,
                             "detail": f"invalid JSON from upstream ({e}); body: {body_text[:300]}"}
@@ -173,7 +292,8 @@ async def chat_completion(model, messages, temperature=None, max_tokens=0,
 # ── Convenience wrappers ─────────────────────────────────────────────────────
 
 async def chat_completion_text(model, messages, temperature=None,
-                               max_tokens=0, reasoning=None):
+                                max_tokens=0, reasoning=None, top_k=None,
+                                channel_key=None, provider_lock=None):
     """
     Convenience wrapper: returns the assistant's text content directly,
     or an error string starting with '*Error'.
@@ -190,7 +310,8 @@ async def chat_completion_text(model, messages, temperature=None,
     """
     data = await chat_completion(
         model, messages, temperature=temperature,
-        max_tokens=max_tokens, reasoning=reasoning,
+        max_tokens=max_tokens, reasoning=reasoning, top_k=top_k,
+        channel_key=channel_key, provider_lock=provider_lock,
     )
 
     # --- Error envelopes (either ours or upstream's) --------------------
@@ -246,6 +367,110 @@ async def chat_completion_text(model, messages, temperature=None,
     return f"*Error: unexpected content type {type(content).__name__}*"
 
 
+async def chat_completion_text_with_thinking(model, messages, temperature=None,
+                                              max_tokens=0, reasoning=None, top_k=None,
+                                              channel_key=None, provider_lock=None):
+    """Like chat_completion_text but returns (text, thinking_text_or_None).
+
+    Extracts reasoning/thinking content from the response where available.
+    OpenRouter returns it as message.reasoning_content (Anthropic-style) or
+    as 'thinking' type blocks inside message.content. Returns (text, None)
+    if no thinking content is found.
+    """
+    data = await chat_completion(
+        model, messages, temperature=temperature,
+        max_tokens=max_tokens, reasoning=reasoning, top_k=top_k,
+        channel_key=channel_key, provider_lock=provider_lock,
+    )
+
+    if data.get("error"):
+        status, detail = _extract_error_detail(data)
+        prefix = f"Error {status}" if status else "Error"
+        return f"*{prefix}: {detail}*", None
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        finish = None
+        if isinstance(choices, list) and choices:
+            finish = choices[0].get("finish_reason")
+        hint = f" (finish_reason={finish})" if finish else ""
+        return (f"*Error: upstream returned no choices{hint} — likely a "
+                f"moderation block, rate limit, or empty reply. "
+                f"Try rephrasing or switching models.*"), None
+
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message") if isinstance(first.get("message"), dict) else {}
+    content = message.get("content")
+    refusal = message.get("refusal")
+    finish_reason = first.get("finish_reason")
+
+    # Debug: log thinking-related fields in the response
+    thinking_keys = [k for k in message if "reason" in k.lower() or "thinking" in k.lower()]
+    if thinking_keys:
+        print(f"🧠 thinking fields present: {thinking_keys}")
+    if isinstance(content, list):
+        block_types = [b.get("type", "?") for b in content if isinstance(b, dict)]
+        if any(t in ("thinking", "reasoning") for t in block_types):
+            print(f"🧠 thinking content block types: {block_types}")
+
+    # Extract thinking content — check common locations in the response
+    thinking_text = None
+    # OpenRouter standard: message.reasoning (string)
+    r = message.get("reasoning")
+    if isinstance(r, str) and r.strip():
+        thinking_text = r
+    # Anthropic direct: message.reasoning_content (string)
+    if thinking_text is None:
+        rc = message.get("reasoning_content")
+        if isinstance(rc, str) and rc.strip():
+            thinking_text = rc
+    # Block-style: 'thinking' type blocks inside content list
+    if thinking_text is None and isinstance(content, list):
+        thinking_parts = [
+            b.get("thinking", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "thinking"
+        ]
+        joined_thinking = "\n".join(p for p in thinking_parts if p).strip()
+        if joined_thinking:
+            thinking_text = joined_thinking
+    # reasoning_details array (structured reasoning from some models)
+    if thinking_text is None:
+        rd = message.get("reasoning_details")
+        if isinstance(rd, list):
+            text_parts = []
+            for item in rd:
+                if isinstance(item, dict):
+                    t = item.get("text", "")
+                    if t:
+                        text_parts.append(t)
+            joined_rd = "\n".join(text_parts).strip()
+            if joined_rd:
+                thinking_text = joined_rd
+
+    if content is None:
+        if refusal:
+            return f"*Model refused: {str(refusal)[:300]}*", None
+        hint = f" (finish_reason={finish_reason})" if finish_reason else ""
+        return (f"*Error: model returned no content{hint} — likely a "
+                f"content filter or empty response.*"), None
+
+    if isinstance(content, list):
+        text_parts = [
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        joined = "\n".join(p for p in text_parts if p).strip()
+        if joined:
+            return joined, thinking_text
+        return ("*Error: model returned content blocks with no text. "
+                "The model may have emitted only non-text output.*"), None
+
+    if isinstance(content, str):
+        return content, thinking_text
+
+    return f"*Error: unexpected content type {type(content).__name__}*", None
+
+
 # ── Image Generation ─────────────────────────────────────────────────────────
 
 # Default size sent to nanoGPT's /images/generations endpoint. OpenRouter's
@@ -253,7 +478,7 @@ async def chat_completion_text(model, messages, temperature=None,
 DEFAULT_IMAGE_SIZE = "1024x1024"
 
 
-async def generate_image(prompt, model, reference_images=None):
+async def generate_image(prompt, model, reference_images=None, provider_lock=None):
     """
     Generate an image via the active provider and return a normalized dict:
 
@@ -267,13 +492,13 @@ async def generate_image(prompt, model, reference_images=None):
     reference_images: optional list of base64 data URI strings to send as
     input images (image-to-image / reference-image workflows).
     """
-    prov = getattr(config, "PROVIDER", "openrouter").lower()
+    prov = get_provider()
     if prov == "nanogpt":
-        return await _generate_image_nanogpt(prompt, model, reference_images=reference_images)
-    return await _generate_image_openrouter(prompt, model, reference_images=reference_images)
+        return await _generate_image_nanogpt(prompt, model, reference_images=reference_images, provider_lock=provider_lock)
+    return await _generate_image_openrouter(prompt, model, reference_images=reference_images, provider_lock=provider_lock)
 
 
-async def _generate_image_nanogpt(prompt, model, reference_images=None):
+async def _generate_image_nanogpt(prompt, model, reference_images=None, provider_lock=None):
     """Call nanoGPT's OpenAI-style /v1/images/generations endpoint."""
     payload = {
         "model": normalize_model_id(model),
@@ -282,13 +507,15 @@ async def _generate_image_nanogpt(prompt, model, reference_images=None):
         "size": DEFAULT_IMAGE_SIZE,
         "response_format": "b64_json",
     }
+    if provider_lock:
+        payload["provider"] = {"order": [provider_lock]}
     if reference_images:
         if len(reference_images) == 1:
             payload["imageDataUrl"] = reference_images[0]
         else:
             payload["imageDataUrls"] = reference_images
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
             async with session.post(
                 f"{_base_url()}/images/generations",
                 headers=_headers(),
@@ -324,7 +551,7 @@ def _data_uri_to_base64(url):
     return url.split(",", 1)[1]
 
 
-async def _generate_image_openrouter(prompt, model, reference_images=None):
+async def _generate_image_openrouter(prompt, model, reference_images=None, provider_lock=None):
     """
     OpenRouter tunnels image generation through chat completions with
     modalities=["image"]. Response shape varies by model, so we
@@ -345,6 +572,7 @@ async def _generate_image_openrouter(prompt, model, reference_images=None):
         model,
         messages,
         modalities=["image"],
+        provider_lock=provider_lock,
     )
 
     # --- Error envelopes (ours or upstream) ----------------------------
@@ -433,7 +661,7 @@ async def get_credits():
             "error": str or None,
         }
     """
-    provider = getattr(config, "PROVIDER", "openrouter").lower()
+    provider = get_provider()
     result = {"remaining": 0, "used": 0, "total": 0, "label": provider_name(), "error": None}
 
     def _safe_float(v, default=0.0):
@@ -535,7 +763,7 @@ async def get_models():
 
     Returns an empty list on error (caller should check).
     """
-    provider = getattr(config, "PROVIDER", "openrouter").lower()
+    provider = get_provider()
 
     # Primary model list (chat/text models).
     url = f"{_base_url()}/models"

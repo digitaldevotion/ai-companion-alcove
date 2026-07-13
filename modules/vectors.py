@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================
-# Alcove v1.3.0 — vectors.py
+# Alcove — vectors.py
 # Copyright (C) 2026 Robert Shea
 # This software is distributed as FREEWARE. Please refer to the readme.txt file for more information.
 # ============================================
@@ -15,16 +15,22 @@ import chromadb
 # ── Constants ────────────────────────────────────────────────────────────────
 
 _COLLECTION_NAME = "search_references"
-_DATA_DIR = Path(__file__).parent.parent / "search_vectors_data"
-_MANIFEST_FILE = _DATA_DIR / "manifest.txt"
 _CHUNK_OVERLAP = 100    # overlap chars between consecutive chunks
 
 _client = None
 _collection = None
 _chunk_size = 2000  # stored from init, used to estimate results for budget-based queries
+_active_companion_name = None  # tracked dynamically to detect companion switches
+_keyword_cache = None  # {"chunks": {(source, idx): doc}, "index": {word: set of (source, idx)}}
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
+
+def _get_paths(companion_name):
+    """Dynamically resolve persistent data paths for the active companion."""
+    data_dir = Path(__file__).parent.parent / "databases" / companion_name / "search_vectors_data"
+    manifest_file = data_dir / "manifest.txt"
+    return data_dir, manifest_file
 
 def _file_signature(path):
     """Return a hash of file mtime + size for change detection."""
@@ -36,22 +42,24 @@ def _file_signature(path):
         return None
 
 
-def _load_manifest():
+def _load_manifest(companion_name):
     """Load the manifest dict (filepath -> signature) from disk."""
+    _, manifest_file = _get_paths(companion_name)
     manifest = {}
-    if _MANIFEST_FILE.exists():
-        for line in _MANIFEST_FILE.read_text().splitlines():
+    if manifest_file.exists():
+        for line in manifest_file.read_text().splitlines():
             if "|" in line:
                 sig, fp = line.split("|", 1)
                 manifest[fp] = sig
     return manifest
 
 
-def _save_manifest(manifest):
+def _save_manifest(manifest, companion_name):
     """Write the manifest dict to disk."""
-    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    data_dir, manifest_file = _get_paths(companion_name)
+    data_dir.mkdir(parents=True, exist_ok=True)
     lines = [f"{sig}|{fp}" for fp, sig in manifest.items()]
-    _MANIFEST_FILE.write_text("\n".join(lines) + "\n")
+    manifest_file.write_text("\n".join(lines) + "\n")
 
 
 def _chunk_text(text, chunk_size, overlap=_CHUNK_OVERLAP):
@@ -90,37 +98,64 @@ def _read_file(path):
         return ""
 
 
+def _build_keyword_cache():
+    """Load the full collection and build an inverted index for keyword lookups."""
+    global _keyword_cache
+    all_data = _collection.get(include=["documents", "metadatas"])
+    all_chunks = {}
+    inverted_index = {}
+    for doc, meta in zip(all_data["documents"], all_data["metadatas"]):
+        source = meta.get("source_file", "unknown")
+        idx = meta.get("chunk_index", 0)
+        key = (source, idx)
+        all_chunks[key] = doc
+        for word in set(re.findall(r"\w+", doc.lower())):
+            if word not in inverted_index:
+                inverted_index[word] = set()
+            inverted_index[word].add(key)
+    _keyword_cache = {"chunks": all_chunks, "index": inverted_index}
+
+
+def _invalidate_keyword_cache():
+    global _keyword_cache
+    _keyword_cache = None
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
-def init_vector_store(reference_files, chunk_size=2000):
+def init_vector_store(reference_files, chunk_size=2000, companion_name="default"):
     """Initialize or reopen the ChromaDB vector store and sync with reference_files.
 
     - Embeds new or changed files
     - Removes chunks for files no longer in reference_files
     - Skips unchanged files (manifest-based change detection)
     """
-    global _client, _collection, _chunk_size
+    global _client, _collection, _chunk_size, _active_companion_name
 
     try:
-        _init_vector_store_inner(reference_files, chunk_size)
+        _init_vector_store_inner(reference_files, chunk_size, companion_name)
+        _active_companion_name = companion_name
     except Exception as e:
-        print(f"⚠️ vector store init failed (search will be unavailable): {e}")
+        print(f"⚠️ vector store init failed for companion '{companion_name}' (search will be unavailable): {e}")
         _collection = None
+        _active_companion_name = None
+    _invalidate_keyword_cache()
 
 
-def _init_vector_store_inner(reference_files, chunk_size):
+def _init_vector_store_inner(reference_files, chunk_size, companion_name):
     """Internal implementation of init_vector_store. Errors are caught by the caller."""
     global _client, _collection, _chunk_size
 
     _chunk_size = chunk_size
-    _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _client = chromadb.PersistentClient(path=str(_DATA_DIR))
+    data_dir, _ = _get_paths(companion_name)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _client = chromadb.PersistentClient(path=str(data_dir))
     _collection = _client.get_or_create_collection(
         name=_COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
 
-    manifest = _load_manifest()
+    manifest = _load_manifest(companion_name)
     current_files = {str(p) for p in reference_files}
 
     # ── Remove stale chunks (files no longer in reference_files) ──
@@ -186,17 +221,17 @@ def _init_vector_store_inner(reference_files, chunk_size):
         embedded += 1
         print(f"  📄 vectors: embedded {filepath} ({len(chunks)} chunk(s))")
 
-    _save_manifest(manifest)
+    _save_manifest(manifest, companion_name)
 
     total = _collection.count()
     print(f"  🔎 vectors: store ready — {total} chunks total "
-          f"({embedded} file(s) embedded, {skipped} unchanged)")
+          f"({embedded} new file(s) embedded, {skipped} unchanged)")
 
 
 def search_vectors(query, max_results=5, max_chars=0, maximize_context=False, max_distance=0.8, keyword_selectivity=0.10):
     """Hybrid search: keyword pass (selective exact matches) + vector pass
     (semantic neighbors). Returns (result_text, chunk_count, raw_chunks,
-    raw_chars, collection_total, relevant_count), or ("", 0, 0, 0, 0, 0, 0).
+    raw_chars, collection_total, relevant_count), or ("", 0, 0, 0, 0, 0).
 
     Keyword pass: splits the query into words and does a case-insensitive
     match against all chunks. Words that match more than keyword_selectivity
@@ -212,10 +247,9 @@ def search_vectors(query, max_results=5, max_chars=0, maximize_context=False, ma
     vector-only matches, deduplicated by (source_file, chunk_index).
     max_results=0 means determine automatically. max_chars=0 means unlimited.
     """
-    if _collection is None or _collection.count() == 0:
-        return "", 0, 0, 0, 0, 0
-
     try:
+        if _collection is None or _collection.count() == 0:
+            return "", 0, 0, 0, 0, 0
         return _search_vectors_inner(
             query, max_results, max_chars, maximize_context,
             max_distance, keyword_selectivity,
@@ -257,25 +291,20 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
 
     keyword_hits = {}  # (source_file, chunk_index) -> document_text
     if query_words:
-        all_data = _collection.get(include=["documents", "metadatas"])
+        if _keyword_cache is None:
+            _build_keyword_cache()
+        all_chunks = _keyword_cache["chunks"]
+        inverted_index = _keyword_cache["index"]
 
-        # Build a lookup: (source, idx) -> document_text
-        all_chunks = {}  # (source_file, chunk_index) -> document_text
-        for doc, meta in zip(all_data["documents"], all_data["metadatas"]):
-            source = meta.get("source_file", "unknown")
-            idx = meta.get("chunk_index", 0)
-            all_chunks[(source, idx)] = doc
-
-        # Count how many chunks each keyword matches
         word_match_counts = {}
         word_patterns = {}
         for w in query_words:
             pattern = re.compile(re.escape(w), re.IGNORECASE)
             word_patterns[w] = pattern
-            count = sum(1 for doc in all_data["documents"] if pattern.search(doc))
+            candidates = inverted_index.get(w.lower(), set())
+            count = sum(1 for key in candidates if pattern.search(all_chunks[key]))
             word_match_counts[w] = count
 
-        # Determine which keywords are selective (match < selectivity% of collection)
         max_common_hits = collection_total * keyword_selectivity
         selective_words = {w for w, c in word_match_counts.items() if c <= max_common_hits}
         common_words = {w for w, c in word_match_counts.items() if c > max_common_hits}
@@ -285,14 +314,18 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
                   f"{collection_total}): "
                   + ", ".join(f"{w!r} ({word_match_counts[w]})" for w in common_words))
 
-        # Build per-word chunk sets
-        word_chunk_sets = {}  # word -> set of (source, idx)
-        for key, doc in all_chunks.items():
-            for w in query_words:
-                if word_patterns[w].search(doc):
+        word_chunk_sets = {}
+        selective_scores = {}
+        for w in query_words:
+            candidates = inverted_index.get(w.lower(), set())
+            pattern = word_patterns[w]
+            for key in candidates:
+                if pattern.search(all_chunks[key]):
                     if w not in word_chunk_sets:
                         word_chunk_sets[w] = set()
                     word_chunk_sets[w].add(key)
+                    if w in selective_words:
+                        selective_scores[key] = selective_scores.get(key, 0) + 1
 
         # Keep chunks that match at least one selective keyword.
         # Chunks that ONLY match common keywords are dropped.
@@ -304,6 +337,14 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
         # Also keep chunks that match BOTH a common keyword AND a selective one
         # (they're already in kept_keys from the selective word above).
         # Chunks matching ONLY common words are excluded.
+
+        # Cap keyword hits when not maximizing context (mirrors vector pass cap)
+        keyword_cap = max(15, collection_total * 15 // 100) if not maximize_context else 0
+        if keyword_cap and len(kept_keys) > keyword_cap:
+            sorted_keys = sorted(kept_keys, key=lambda k: selective_scores.get(k, 0), reverse=True)
+            kept_keys = set(sorted_keys[:keyword_cap])
+            print(f"🔎 keyword pass: capped at {keyword_cap} (15% of {collection_total}), "
+                  f"trimmed {len(sorted_keys) - keyword_cap} lowest-scoring chunks")
 
         for key in kept_keys:
             keyword_hits[key] = all_chunks[key]
@@ -331,7 +372,7 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
         include=["documents", "metadatas", "distances"],
     )
 
-    vector_hits = {}  # (source_file, chunk_index) -> document_text
+    vector_hits = {}  # (source_file, chunk_index) -> (document_text, distance)
     vector_count_before_filter = 0
     if results["documents"] and results["documents"][0]:
         vector_count_before_filter = len(results["documents"][0])
@@ -342,7 +383,7 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
             if dist <= max_distance:
                 source = meta.get("source_file", "unknown")
                 idx = meta.get("chunk_index", 0)
-                vector_hits[(source, idx)] = doc
+                vector_hits[(source, idx)] = (doc, dist)
                 filtered_dists.append(dist)
         if filtered_dists:
             print(f"🔎 vector pass: {len(vector_hits)}/{vector_count_before_filter} chunks "
@@ -355,14 +396,18 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
         print(f"🔎 vector pass: no results from ChromaDB")
 
     # ── Merge: keyword hits first, then vector-only ─────────────────────────
-    # Use ordered dict to preserve insertion order: keyword matches are
-    # authoritative and come first; vector-only matches follow.
-    merged = {}  # (source_file, chunk_index) -> document_text
+    # Tag each chunk with origin and scoring metadata for priority-ordered output.
+    # Tier 0 = keyword (authoritative), Tier 1 = vector-only, Tier 2 = neighbor.
+    # _ORIGIN_KEYWORD = 0
+    # _ORIGIN_VECTOR = 1
+    # _ORIGIN_NEIGHBOR = 2
+    merged = {}  # (source_file, chunk_index) -> (doc, tier, score, distance)
     for key, doc in keyword_hits.items():
-        merged[key] = doc
-    for key, doc in vector_hits.items():
+        score = selective_scores.get(key, 0)
+        merged[key] = (doc, 0, score, 0.0)
+    for key, (doc, dist) in vector_hits.items():
         if key not in merged:
-            merged[key] = doc
+            merged[key] = (doc, 1, 0, dist)
 
     keyword_only_count = len(keyword_hits)
     vector_only_count = len([k for k in vector_hits if k not in keyword_hits])
@@ -374,12 +419,12 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
     if not merged:
         return "", 0, 0, 0, collection_total, 0
 
-    # Collect matched chunks into per-file dicts
-    file_chunks = {}  # source_file → {chunk_index: document_text}
-    for (source, idx), doc in merged.items():
+    # Collect matched chunks into per-file dicts with metadata
+    file_chunks = {}  # source_file → {chunk_index: (doc, tier, score, distance)}
+    for (source, idx), (doc, tier, score, dist) in merged.items():
         if source not in file_chunks:
             file_chunks[source] = {}
-        file_chunks[source][idx] = doc
+        file_chunks[source][idx] = (doc, tier, score, dist)
 
     # ── Neighbor expansion ──────────────────────────────────────────────────
     # Any primary hit can be cut mid-sentence at a chunk boundary, so neighbors
@@ -420,7 +465,7 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
         try:
             fetched = _collection.get(ids=[nid], include=["documents"])
             if fetched["documents"]:
-                file_chunks[source][nidx] = fetched["documents"][0]
+                file_chunks[source][nidx] = (fetched["documents"][0], 2, 0, 0.0)
                 neighbors_fetched += 1
         except Exception:
             pass
@@ -428,27 +473,55 @@ def _search_vectors_inner(query, max_results, max_chars, maximize_context, max_d
     print(f"🔎 neighbor expansion: {neighbors_fetched} next-chunk neighbor(s) added "
           f"(cap={max_neighbors})")
 
-    # Build result text, chunk by chunk, enforcing max_chars per chunk
-    # rather than per file so a single large file can't blow the budget.
+    # Build result text in priority order so that when max_chars is hit,
+    # the least valuable chunks are trimmed first:
+    #   Tier 0 (keyword): sorted by selective score descending, then source/idx
+    #   Tier 1 (vector):  sorted by distance ascending (closer = better), then source/idx
+    #   Tier 2 (neighbor): sorted by source/idx
     raw_chunks = sum(len(chunks) for chunks in file_chunks.values())
-    raw_chars = sum(len(chunks[idx]) for chunks in file_chunks.values() for idx in chunks)
+    raw_chars = sum(len(v[0].encode("utf-8")) for chunks in file_chunks.values() for v in chunks.values())
+
+    all_entries = []  # list of (tier, score, distance, source, idx, doc)
+    for source, chunks in file_chunks.items():
+        for idx, (doc, tier, score, dist) in chunks.items():
+            all_entries.append((tier, score, dist, source, idx, doc))
+
+    def _entry_sort_key(entry):
+        tier, score, dist, source, idx, _ = entry
+        if tier == 0:
+            return (0, -score, source, idx)
+        elif tier == 1:
+            return (1, dist, source, idx)
+        else:
+            return (2, source, idx)
+
+    all_entries.sort(key=_entry_sort_key)
+
     parts = []
-    total_chars = 0
+    total_bytes = 0
     total_chunks_used = 0
-    for source in sorted(file_chunks):
-        chunks = file_chunks[source]
-        chunk_parts = []
-        for idx in sorted(chunks):
-            chunk_text = chunks[idx]
-            if max_chars > 0 and total_chars + len(chunk_text) > max_chars:
-                break
-            chunk_parts.append(chunk_text)
-            total_chars += len(chunk_text)
-            total_chunks_used += 1
-        if chunk_parts:
-            parts.append(f"[{source}]\n" + "\n".join(chunk_parts))
-        if max_chars > 0 and total_chars >= max_chars:
+    current_source = None
+    chunk_parts = []
+
+    for tier, score, dist, source, idx, doc in all_entries:
+        chunk_bytes = len(doc.encode("utf-8"))
+        if max_chars > 0 and total_bytes + chunk_bytes > max_chars:
+            if chunk_parts and current_source is not None:
+                parts.append(f"[{current_source}]\n" + "\n".join(chunk_parts))
+                chunk_parts = []
+                current_source = None
             break
+        if source != current_source:
+            if chunk_parts and current_source is not None:
+                parts.append(f"[{current_source}]\n" + "\n".join(chunk_parts))
+            chunk_parts = []
+            current_source = source
+        chunk_parts.append(doc)
+        total_bytes += chunk_bytes
+        total_chunks_used += 1
+
+    if chunk_parts and current_source is not None:
+        parts.append(f"[{current_source}]\n" + "\n".join(chunk_parts))
 
     if not parts:
         return "", 0, 0, 0, 0, 0

@@ -1,24 +1,32 @@
 # ============================================
-# Alcove v1.3.0 — livevoice.py
-# Live (hands-free) voice chat support via discord-ext-voice-recv.
+# Alcove — voice_live.py
+# Live (hands-free) voice chat support via pycord's native Sink API.
 # Copyright (C) 2026 Robert Shea
 # This software is distributed as FREEWARE. Please refer to the readme.txt
 # file for more information.
 # ============================================
 #
 # This module is intentionally isolated from the rest of the codebase: the
-# main bot continues to use plain discord.py, and only this file imports the
-# voice-recv extension. The seam is the LiveVoiceSession class — main.py
-# constructs one when !joinLive runs and calls .stop() on !leave.
+# main bot continues to use pycord's standard VoiceClient, and only this
+# file uses the Sink-based listening API. The seam is the LiveVoiceSession
+# class — main.py constructs one when !joinLive runs and calls .stop()
+# on !leave.
 #
 # Audio path:
-#   discord-ext-voice-recv → AudioSink.write() (called every 20ms from a
-#   worker thread with 48kHz stereo s16le PCM frames) → per-user buffer +
-#   webrtcvad-based end-of-utterance detection → on silence-after-speech we
-#   schedule the supplied async callback on the bot's event loop with a
-#   wav-formatted blob of the captured speech. The callback (provided by
-#   main.py) handles STT → LLM → TTS → playback through the same voice
-#   client we used to listen.
+#   pycord VoiceClient.start_listening() → PacketRouter → opus decode →
+#   _LiveSink.write() (called from the PacketRouter thread with decoded
+#   48kHz stereo s16le PCM frames) → per-user buffer + webrtcvad-based
+#   end-of-utterance detection → on silence-after-speech we schedule the
+#   supplied async callback on the bot's event loop with a wav-formatted
+#   blob of the captured speech. The callback (provided by main.py) handles
+#   STT → LLM → TTS → playback through the same voice client we used to
+#   listen.
+#
+# DAVE STATUS: Voice reception is currently broken due to Discord's DAVE
+# (End-to-End Encryption) protocol. pycord's start_listening() emits a
+# RuntimeWarning about this. Tracked at:
+#   https://github.com/Pycord-Development/pycord/issues/3139
+# When that is resolved, this module should work without further changes.
 #
 # v1 limitations: single-user only, no barge-in, no wake word, no streaming
 # STT/TTS. See the design notes in the !joinLive command for what's planned.
@@ -29,16 +37,14 @@ import time
 import traceback
 import wave
 
-# discord-ext-voice-recv is optional — the module imports it lazily so the
-# bot still starts on installs that don't have it (e.g. users who don't care
-# about live voice). The !joinLive command is the gatekeeper that surfaces a
-# friendly error if either dep is missing.
 try:
-    from discord.ext import voice_recv
-    _HAS_VOICE_RECV = True
+    import discord
+    from discord.sinks import Sink
+    _HAS_PYCORD = True
 except Exception:
-    voice_recv = None
-    _HAS_VOICE_RECV = False
+    discord = None
+    Sink = None
+    _HAS_PYCORD = False
 
 try:
     import webrtcvad
@@ -47,16 +53,17 @@ except Exception:
     webrtcvad = None
     _HAS_WEBRTCVAD = False
 
+from .voice_utils import mp3_to_pcm, play_pcm_on_voice_client
+
 
 def dependencies_available():
-    # Used by !joinLive to give a helpful error before trying to connect.
-    return _HAS_VOICE_RECV and _HAS_WEBRTCVAD
+    return _HAS_PYCORD and _HAS_WEBRTCVAD
 
 
 def missing_dependencies():
     missing = []
-    if not _HAS_VOICE_RECV:
-        missing.append("discord-ext-voice-recv")
+    if not _HAS_PYCORD:
+        missing.append("py-cord[voice]")
     if not _HAS_WEBRTCVAD:
         missing.append("webrtcvad")
     return missing
@@ -92,9 +99,7 @@ def _pcm48k_stereo_to_16k_mono(pcm_bytes):
     if n_pairs == 0:
         return b""
     samples = struct.unpack(f"<{n_pairs * 2}h", pcm_bytes)
-    # Average to mono (signed average without overflow risk since we shift)
     mono = [(samples[i * 2] + samples[i * 2 + 1]) >> 1 for i in range(n_pairs)]
-    # 3:1 decimation: every third sample
     out = mono[::3]
     return struct.pack(f"<{len(out)}h", *out)
 
@@ -129,9 +134,9 @@ class _UtteranceState:
 
 
 class LiveVoiceSession:
-    # Owns the voice connection (a VoiceRecvClient) for the lifetime of a
-    # !joinLive session. main.py calls .start(channel, ...) to connect and
-    # begin listening, and .stop() to tear it all down.
+    # Owns the voice connection for the lifetime of a !joinLive session.
+    # main.py calls .start(channel, ...) to connect and begin listening,
+    # and .stop() to tear it all down.
     #
     # The on_utterance callback is invoked once per detected end-of-utterance
     # with (wav_bytes, member). It must be a coroutine function — it'll run
@@ -150,7 +155,7 @@ class LiveVoiceSession:
         # Same metric for the minimum-utterance filter.
         self._min_speech_frames = max(1, _MIN_UTTERANCE_MS // _FRAME_MS)
 
-        self.voice_client = None  # VoiceRecvClient once connected
+        self.voice_client = None  # pycord VoiceClient once connected
         self.text_channel = None  # discord.TextChannel for status messages
         self.target_user_id = None  # only used when single_user is True
         self.target_member = None
@@ -161,10 +166,11 @@ class LiveVoiceSession:
         self._stopped = False
 
     async def start(self, voice_channel, *, text_channel, author, loop):
-        # Connect to the voice channel using VoiceRecvClient (a subclass of
-        # VoiceClient that supports recording). Caller is responsible for
-        # ensuring no other VoiceClient is currently connected — we don't
-        # try to coexist with the push-to-talk voice_manager.
+        # Connect to the voice channel using pycord's standard VoiceClient
+        # (which supports native voice receiving via start_listening).
+        # Caller is responsible for ensuring no other VoiceClient is currently
+        # connected — we don't try to coexist with the push-to-talk
+        # voice_manager.
         if not dependencies_available():
             raise RuntimeError(
                 f"livevoice missing dependencies: {missing_dependencies()}"
@@ -175,16 +181,12 @@ class LiveVoiceSession:
         self.target_user_id = author.id if self.single_user else None
         self._loop = loop
 
-        # discord.VoiceChannel.connect supports a `cls` kwarg that picks
-        # which VoiceClient subclass to instantiate.
-        self.voice_client = await voice_channel.connect(
-            cls=voice_recv.VoiceRecvClient
-        )
+        self.voice_client = await voice_channel.connect()
         print(f"🔊 [livevoice] Connected to {voice_channel.name} "
               f"(target user: {author.display_name if self.single_user else 'all'})")
 
         self._sink = _LiveSink(self)
-        self.voice_client.listen(self._sink)
+        self.voice_client.start_listening(self._sink)
         self._last_recognized_speech_ts = time.time()
         self._idle_check_task = asyncio.create_task(self._idle_watchdog())
 
@@ -201,7 +203,6 @@ class LiveVoiceSession:
             pass
         try:
             if self.voice_client is not None and self.voice_client.is_connected():
-                # stop_listening is a no-op if not currently listening.
                 try:
                     self.voice_client.stop_listening()
                 except Exception:
@@ -220,40 +221,12 @@ class LiveVoiceSession:
         )
 
     async def play_audio_bytes(self, mp3_bytes):
-        # Hand off to the existing voice_manager-style playback. Reuses the
-        # mp3_to_pcm + FFmpegPCMAudio path from voice.py. We import locally
-        # to avoid a circular dependency at module load time.
-        from .voice import mp3_to_pcm
-        import discord
-        import os
-        import tempfile
         if not self.is_active():
             return False
         wav_bytes = mp3_to_pcm(mp3_bytes)
         if wav_bytes is None:
             return False
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(wav_bytes)
-            tmp_path = tmp.name
-        try:
-            while self.voice_client.is_playing():
-                await asyncio.sleep(0.1)
-            audio_source = discord.FFmpegPCMAudio(tmp_path)
-            done = asyncio.Event()
-            def _after(err):
-                if err:
-                    print(f"⚠️ [livevoice] playback error: {err}")
-                done.set()
-            self.voice_client.play(audio_source, after=_after)
-            await done.wait()
-        finally:
-            await asyncio.sleep(0.2)
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except Exception:
-                pass
-        return True
+        return await play_pcm_on_voice_client(self.voice_client, wav_bytes, log_prefix="[livevoice] ")
 
     async def _idle_watchdog(self):
         # Auto-disconnect after IDLE_TIMEOUT_MIN of no recognized speech.
@@ -279,9 +252,10 @@ class LiveVoiceSession:
             print(f"⚠️ [livevoice] idle watchdog error: {e}")
 
     # --- Sink callback bridge ---------------------------------------------
-    # _LiveSink runs on a worker thread. These methods are how it talks back
-    # to the session. They must be thread-safe — anything that needs to
-    # touch the event loop has to go through run_coroutine_threadsafe.
+    # _LiveSink runs on the PacketRouter worker thread. These methods are
+    # how it talks back to the session. They must be thread-safe — anything
+    # that needs to touch the event loop has to go through
+    # run_coroutine_threadsafe.
 
     def _on_utterance_ready_threadsafe(self, pcm_48k_stereo, member):
         # Called from the audio thread once VAD decides an utterance is
@@ -312,16 +286,22 @@ class LiveVoiceSession:
             traceback.print_exc()
 
 
-# ---------- AudioSink implementation ---------------------------------------
-# Defined conditionally because voice_recv may not be importable on installs
-# that don't have the optional dep. dependencies_available() gates the only
-# code path that constructs this.
-if _HAS_VOICE_RECV:
+# ---------- Sink implementation -------------------------------------------
+# Defined conditionally because pycord may not have the Sink API available
+# on installs that don't have the voice deps. dependencies_available()
+# gates the only code path that constructs this.
+if _HAS_PYCORD and Sink is not None:
 
-    class _LiveSink(voice_recv.AudioSink):
+    class _LiveSink(Sink):
         # Per-user buffering + webrtcvad state machine. write() is invoked
-        # from a worker thread for every 20ms frame Discord sends us, so
-        # everything in here must be cheap and thread-safe.
+        # from the PacketRouter worker thread for every decoded audio frame
+        # pycord sends us, so everything in here must be cheap and
+        # thread-safe.
+        #
+        # pycord's PacketRouter calls sink.write(data, user) where data is a
+        # VoiceData object with a .pcm attribute (decoded 48kHz stereo s16le
+        # bytes) and .source is the Member. The user parameter is the same
+        # Member/Object.
 
         def __init__(self, session):
             super().__init__()
@@ -329,35 +309,44 @@ if _HAS_VOICE_RECV:
             self._states = {}  # user_id -> _UtteranceState
             self._vad = webrtcvad.Vad(_VAD_AGGRESSIVENESS) if _HAS_WEBRTCVAD else None
 
-        def wants_opus(self):
+        def is_opus(self):
             # We want decoded PCM, not opus packets — VAD needs raw samples
             # and STT wants wav.
             return False
 
-        def write(self, user, data):
-            # `user` may be None for very early packets before SSRC mapping
-            # resolves; we just drop those. `data.pcm` is 48kHz stereo s16le.
-            if user is None or data is None or not data.pcm:
+        def write(self, data, user):
+            # pycord passes VoiceData as `data` and Member/User/Object as
+            # `user`. data.pcm is 48kHz stereo s16le (or empty if opus).
+            # `user` may be a discord.Object with just an .id if SSRC
+            # mapping hasn't resolved yet.
+            if user is None or data is None:
+                return
+            pcm = getattr(data, "pcm", None)
+            if not pcm:
                 return
             # Single-user filter.
             if self.session.single_user:
                 if self.session.target_user_id is None:
                     return
-                if user.id != self.session.target_user_id:
+                user_id = getattr(user, "id", None)
+                if user_id is None or user_id != self.session.target_user_id:
                     return
             try:
-                self._process_frame(user, data.pcm)
+                self._process_frame(user, pcm)
             except Exception as e:
                 # Never let an exception escape into the audio thread —
-                # discord-ext-voice-recv tends to tear down the sink if it
+                # pycord's PacketRouter tends to tear down the sink if it
                 # does, killing the whole session.
                 print(f"⚠️ [livevoice] sink frame error: {e}")
 
         def _process_frame(self, user, pcm_48k_stereo):
-            state = self._states.get(user.id)
+            user_id = getattr(user, "id", None)
+            if user_id is None:
+                return
+            state = self._states.get(user_id)
             if state is None:
                 state = _UtteranceState()
-                self._states[user.id] = state
+                self._states[user_id] = state
 
             # VAD on a downsampled mono copy. We ALSO keep the original
             # 48kHz stereo bytes in the buffer so we can hand a faithful wav
@@ -396,10 +385,10 @@ if _HAS_VOICE_RECV:
                             )
                         # Reset whether or not we forwarded — short blips
                         # get dropped silently.
-                        self._states[user.id] = _UtteranceState()
+                        self._states[user_id] = _UtteranceState()
 
         def cleanup(self):
-            # Called by voice_recv on disconnect. Flush any in-flight
+            # Called by pycord on disconnect. Flush any in-flight
             # utterance so we don't lose the last thing the user said.
             for user_id, state in list(self._states.items()):
                 if state.speech_started and state.speech_frame_count >= self.session._min_speech_frames:
@@ -415,4 +404,4 @@ else:
     # False and !joinLive bails before getting here.
     class _LiveSink:  # pragma: no cover
         def __init__(self, *_a, **_kw):
-            raise RuntimeError("discord-ext-voice-recv not installed")
+            raise RuntimeError("pycord voice receiving not available")

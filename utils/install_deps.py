@@ -27,14 +27,17 @@ if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.b
 
 
 # ============================================================================
-# !!! LIVE VOICE STATUS — shelved. DO NOT pin discord.py to 2.6.4 again. !!!
+# LIVE VOICE STATUS — receiving is shelved until pycord fixes DAVE receive.
 # ----------------------------------------------------------------------------
-# We attempted to support hands-free live voice via `discord-ext-voice-recv`
-# but ran into a CLOSED BOX on the current Discord voice protocol — there is
-# no version pair of discord.py + voice-recv that works today. The history
-# below is here so neither human nor AI assistant repeats the experiment.
+# Alcove uses pycord (py-cord) as its Discord library. Pycord 2.8+ has native
+# voice receiving via Sink / start_listening(), which replaces the old
+# discord-ext-voice-recv third-party extension we previously used with
+# discord.py. However, Discord's DAVE (End-to-End Encryption) protocol for
+# voice calls breaks the receive path: pycord's start_listening() currently
+# emits a RuntimeWarning that voice reception is broken due to DAVE.
+# Tracked at: https://github.com/Pycord-Development/pycord/issues/3139
 #
-# What was tried, in order:
+# History (pre-migration to pycord):
 #
 #   1. discord.py 2.7.1 + latest discord-ext-voice-recv  (initial attempt)
 #      → Voice gateway connects fine. The PacketRouter thread inside
@@ -44,8 +47,6 @@ if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.b
 #        audio → never finalizes an utterance → never calls STT/LLM/TTS.
 #        Upstream-confirmed issue:
 #            https://github.com/imayhaveborkedit/discord-ext-voice-recv/issues/53
-#        ("Voice recv receives opus packets that decode to gibberish audio
-#        after upgrading to discord.py v2.7.1 from v2.6.4")
 #        At the time of writing, the issue is open and unresolved.
 #
 #   2. Pinned discord.py to ==2.6.4 (the last version voice-recv worked
@@ -55,38 +56,27 @@ if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.b
 #        working. The voice gateway closes the handshake immediately with
 #        WebSocket close code **4017** (unsupported encryption mode).
 #
-#        Why: Discord rolled out DAVE (their end-to-end-encrypted voice
-#        protocol) through 2024–2025 and progressively retired the older
-#        encryption modes. discord.py 2.7.x added support for the new
-#        modes; 2.6.4 predates that work and only knows the retired ones.
-#        Discord's servers now reject 2.6.4 outright. This is a hard wall
-#        on Discord's side — no client-side workaround exists.
+#        Why: Discord rolled out DAVE through 2024–2025 and progressively
+#        retired the older encryption modes. discord.py 2.7.x added support
+#        for the new modes; 2.6.4 predates that work and only knows the
+#        retired ones. Discord's servers now reject 2.6.4 outright.
 #
-#   3. (rollback) Removed the pin. discord.py is left UNPINNED so users
+#   3. (rollback) Removed the pin. discord.py was left UNPINNED so users
 #      always run a version that can at least connect to the voice gateway
-#      for `!join` push-to-talk and TTS playback. This is the current state.
+#      for `!join` push-to-talk and TTS playback.
 #
-# Lesson — DO NOT re-pin discord.py to a pre-2.7 version. Whatever live-voice
-# breakage exists today, downgrading discord.py will make BOTH live voice
-# AND regular voice unusable, because Discord's servers no longer accept
-# the encryption modes the older client speaks.
-#
-# Live voice (`!joinLive`) is therefore shelved until one of:
-#   (a) discord-ext-voice-recv updates to be compatible with discord.py 2.7+
-#       (track issue #53 above — most likely path),
-#   (b) we migrate the `livevoice.py` module to py-cord running in a
-#       separate sidecar process — py-cord has its own working voice-recv
-#       and supports the new encryption modes, but cannot coexist with
-#       discord.py in the same Python interpreter (namespace collision on
-#       `import discord`), so it would have to be an out-of-process daemon,
-#   (c) we implement voice receive ourselves on top of discord.py 2.7's
-#       voice client (RTP demux + opus decode + SSRC→user mapping +
-#       integration with the new encryption modes — significant work).
+#   4. Migrated from discord.py to pycord 2.8+. Pycord supports DAVE
+#      encryption for SENDING (connect/play/disconnect), so `!join`
+#      push-to-talk works. Voice RECEIVING is still broken due to DAVE —
+#      pycord issue #3139 is in progress. The livevoice.py module has been
+#      rewritten to use pycord's native Sink API, so when the pycord team
+#      ships a DAVE-compatible receive pipeline, !joinLive should work
+#      without further code changes on our side.
 #
 # The `livevoice.py` module and the `!joinLive` command are still in the
-# codebase but inert: with the optional deps (`discord-ext-voice-recv`,
-# `webrtcvad-wheels`) uninstalled, dependencies_available() returns False
-# and `!joinLive` surfaces a clean "missing optional deps" message.
+# codebase but inert: the pycord DAVE receive fix is not yet available, so
+# start_listening() will emit a warning and voice reception will not work.
+# When pycord #3139 is resolved, live voice should become functional.
 #
 # The version-aware install logic below (parse_pin / force-reinstall on
 # version mismatch) is retained for future use — harmless when no `==`
@@ -103,20 +93,18 @@ if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.b
 #   (downgrade or upgrade as needed). Specs without a version pin (e.g.
 #   "aiohttp") are only installed when the package is missing entirely.
 DEPENDENCIES = [
-    ("discord.py[voice]", "discord", "Discord bot framework (with voice support)", True),
+    ("py-cord[voice]", "discord", "Discord bot framework — pycord (with voice support)", True),
     ("aiohttp",      "aiohttp",      "Async HTTP client",                   True),
+    ("curl_cffi",    "curl_cffi",    "Browser-impersonating HTTP client (readweb)", True),
     ("certifi",      "certifi",      "SSL certificate bundle",              True),
     ("trafilatura",  "trafilatura",   "Web page content extraction",         True),
-    ("pydub",        "pydub",         "Audio processing",                    True),
     ("elevenlabs",   "elevenlabs",    "ElevenLabs TTS/STT (voice features)", False),
-    ("PyNaCl",       "nacl",          "Voice encryption (discord.py voice)",  False),
-    ("discord-ext-voice-recv", "discord.ext.voice_recv", "Voice receiving (live voice mode)", False),
     ("chromadb", "chromadb", "Vector database (semantic search)", True),
 ]
 
 
 # Regex to peel an `==X.Y.Z` style version spec off a pip name like
-# "discord.py[voice]==2.6.4". We ONLY honor `==` (exact pins); other
+# "py-cord[voice]==2.8.0". We ONLY honor `==` (exact pins); other
 # operators (>=, <, ~=) are ignored by the version-mismatch check, which
 # matches how pip itself treats range specs (no forced reinstall).
 _PIN_RE = re.compile(r"^(?P<base>[^=<>!~ ]+(?:\[[^\]]+\])?)\s*==\s*(?P<ver>[^\s,]+)\s*$")
@@ -128,8 +116,8 @@ def parse_pin(pip_name):
     Returns (base, version) on a hit, or (pip_name, None) when no pin is
     specified or the spec uses a non-`==` operator.
 
-    The base preserves any extras suffix, e.g. "discord.py[voice]==2.6.4"
-    splits to ("discord.py[voice]", "2.6.4"). The extras are kept on the
+    The base preserves any extras suffix, e.g. "py-cord[voice]==2.8.0"
+    splits to ("py-cord[voice]", "2.8.0"). The extras are kept on the
     base so the canonical-name lookup below still works (we strip them at
     that step).
     """
@@ -142,7 +130,7 @@ def parse_pin(pip_name):
 def get_installed_version(pip_base):
     """Return the installed version string for a pip distribution, or None.
 
-    `pip_base` may include extras (e.g. "discord.py[voice]"); we strip
+    `pip_base` may include extras (e.g. "py-cord[voice]"); we strip
     those for the metadata lookup since extras aren't part of the
     distribution name.
     """
@@ -167,7 +155,7 @@ def check_installed(import_name):
 def install_package(pip_name, force_reinstall=False):
     """Attempt to pip install a package. Returns (success, output).
 
-    `pip_name` may include a version spec (e.g. "discord.py[voice]==2.6.4");
+    `pip_name` may include a version spec (e.g. "py-cord[voice]==2.8.0");
     pip honors it natively. `force_reinstall=True` adds `--force-reinstall`
     so an already-installed wrong-version package is replaced.
     """
@@ -235,6 +223,42 @@ def main():
     to_correct_version = []   # installed but wrong pinned version
     results = []
 
+    # Phase 0: Remove packages that conflict with our current dependencies.
+    # py-cord and discord.py both claim the `discord` namespace — having
+    # both installed causes import ambiguity. Likewise discord-ext-voice-recv
+    # depends on discord.py and is no longer used. Remove them if present.
+    _CONFLICTS = [
+        ("discord.py", "Conflicts with py-cord (same `discord` namespace)"),
+        ("discord-ext-voice-recv", "Superseded by py-cord's native Sink API"),
+    ]
+    to_remove = []
+    for pip_name, reason in _CONFLICTS:
+        if get_installed_version(pip_name) is not None:
+            to_remove.append((pip_name, reason))
+
+    if to_remove:
+        print("── Removing conflicting packages ──")
+        print()
+        for pip_name, reason in to_remove:
+            print(f"  Removing {pip_name}... ", end="", flush=True)
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "uninstall", "-y", pip_name],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode == 0:
+                    print(f"✅  ({reason})")
+                else:
+                    print(f"⚠️  uninstall returned non-zero (may need manual removal)")
+            except Exception as e:
+                print(f"⚠️  {e}")
+        # Force-reinstall py-cord to overwrite any stale namespace
+        # files (e.g. discord/ext/__init__.py) left by uninstalled packages.
+        print(f"  Re-installing py-cord[voice] (force)... ", end="", flush=True)
+        success, _ = install_package("py-cord[voice]", force_reinstall=True)
+        print("✅" if success else "❌")
+        print()
+
     # Phase 1: Check what's installed (and at the correct version, when pinned)
     print("── Checking installed packages ──")
     print()
@@ -287,7 +311,7 @@ def main():
         return 0
 
     # Phase 2a: Force-reinstall mismatched pinned versions FIRST.
-    # Doing these before fresh installs means a downgrade of e.g. discord.py
+    # Doing these before fresh installs means a downgrade/upgrade of e.g. py-cord
     # is in place before any package that depends on it gets touched.
     failures = []
     if to_correct_version:
@@ -387,5 +411,36 @@ def main():
     return 1 if any(req for _, req in failures) else 0
 
 
+def _fix_command_scripts():
+    """Ensure *.command scripts are executable and unquarantined on macOS/Linux."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(script_dir) == "utils":
+        root_dir = os.path.dirname(script_dir)
+    else:
+        root_dir = script_dir
+
+    import glob as _glob
+    import stat as _stat
+
+    if os.name != "nt":
+        print()
+        print("── Fixing .command script permissions ──")
+        print()
+        for cmd_file in _glob.glob(os.path.join(root_dir, "*.command")):
+            os.chmod(cmd_file, _stat.S_IRWXU | _stat.S_IRGRP | _stat.S_IXGRP | _stat.S_IROTH | _stat.S_IXOTH)
+            print(f"  chmod 755  {os.path.basename(cmd_file)}")
+
+    if sys.platform == "darwin":
+        if os.name == "nt":
+            print()
+            print("── Unquarantining .command scripts ──")
+            print()
+        for cmd_file in _glob.glob(os.path.join(root_dir, "*.command")):
+            subprocess.run(["xattr", "-d", "com.apple.quarantine", cmd_file], check=False)
+            print(f"  unquarantine  {os.path.basename(cmd_file)}")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    _fix_command_scripts()
+    sys.exit(rc)

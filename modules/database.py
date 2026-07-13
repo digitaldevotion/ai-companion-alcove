@@ -1,15 +1,162 @@
 # ============================================
-# Alcove v1.3.0 — database.py
+# Alcove — database.py
 # SQLite persistence layer
 # Copyright (C) 2026 Robert Shea
 # This software is distributed as FREEWARE. Please refer to the readme.txt file for more information.
 # ============================================
+import os
+import shutil
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 
 
-def init_database():
-    db = sqlite3.connect("companion_data.db")
+# Registry to track which channel is mapped to which companion
+_registry_db = None
+
+
+def get_registry_db():
+    global _registry_db
+    if _registry_db is not None:
+        return _registry_db
+    Path("databases").mkdir(exist_ok=True)
+    _registry_db = sqlite3.connect("databases/registry.db")
+    _registry_db.execute("""
+        CREATE TABLE IF NOT EXISTS channel_registry (
+            channel TEXT PRIMARY KEY,
+            companion TEXT NOT NULL
+        )
+    """)
+    _registry_db.execute("""
+        CREATE TABLE IF NOT EXISTS registry_channel_settings (
+            channel TEXT NOT NULL,
+            param   TEXT NOT NULL,
+            value   TEXT,
+            PRIMARY KEY (channel, param)
+        )
+    """)
+    _registry_db.execute("""
+        CREATE TABLE IF NOT EXISTS registry_global_vars (
+            param     TEXT PRIMARY KEY,
+            value     TEXT,
+            timestamp TEXT
+        )
+    """)
+    _registry_db.commit()
+    return _registry_db
+
+
+def get_channel_companion(channel_name):
+    try:
+        conn = get_registry_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT companion FROM channel_registry WHERE channel = ?", (channel_name,))
+        row = cursor.fetchone()
+        return row[0] if row else "default"
+    except Exception as e:
+        print(f"⚠️ Error reading companion registry: {e}")
+        return "default"
+
+
+def set_channel_companion(channel_name, companion_name):
+    try:
+        conn = get_registry_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO channel_registry (channel, companion)
+            VALUES (?, ?)
+            ON CONFLICT(channel) DO UPDATE SET companion = excluded.companion
+        """, (channel_name, companion_name))
+        conn.commit()
+    except Exception as e:
+        print(f"⚠️ Error updating companion registry: {e}")
+
+
+# Cached connections: companion_name -> sqlite3.Connection
+_db_connections = {}
+
+
+def _is_stub_db(path):
+    # Return True if *path* is an empty/stub database — 0 bytes, or has a
+    # messages table with zero rows. Used to detect a prior failed migration
+    # that left an empty DB at the canonical path alongside a legacy file.
+    try:
+        if path.stat().st_size == 0:
+            return True
+    except OSError:
+        return True
+    conn = None
+    try:
+        conn = sqlite3.connect(str(path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM messages")
+        return cursor.fetchone()[0] == 0
+    except sqlite3.OperationalError:
+        # No messages table — definitely a stub
+        return True
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _migrate_legacy_db(old_db_path, db_path):
+    # Move the legacy companion_data.db into the default companion directory.
+    # Tries os.rename first, falls back to copy+unlink for cross-filesystem
+    # moves. Returns True on success, False on failure (legacy file is left
+    # in place so the caller can fall back to opening it directly).
+    print("🚚 Moving legacy SQLite history database into default compartment folder...")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(old_db_path, db_path)
+        print("✅ Database migration completed successfully.")
+        return True
+    except OSError:
+        pass
+    try:
+        shutil.copy2(old_db_path, db_path)
+        os.unlink(old_db_path)
+        print("✅ Database migration completed (via copy).")
+        return True
+    except Exception as e:
+        print(f"❌ Database file migration failed: {e}")
+        print(f"   Legacy file remains at: {old_db_path}")
+        return False
+
+
+def init_database(companion_name="default"):
+    databases_dir = Path("databases")
+    databases_dir.mkdir(exist_ok=True)
+
+    companion_dir = databases_dir / companion_name
+    companion_dir.mkdir(parents=True, exist_ok=True)
+
+    db_path = companion_dir / "companion_data.db"
+
+    # --- Seamless Migration ---
+    # If a legacy databases/companion_data.db exists, move it into
+    # databases/default/companion_data.db. Handles three scenarios:
+    #   1. Fresh migration (db_path doesn't exist yet)
+    #   2. Retry after prior failed migration (db_path is an empty stub)
+    #   3. Both exist with real data (warn, don't touch either)
+    open_path = db_path
+    if companion_name == "default":
+        old_db_path = databases_dir / "companion_data.db"
+        if old_db_path.exists():
+            if not db_path.exists() or _is_stub_db(db_path):
+                if db_path.exists():
+                    try:
+                        db_path.unlink()
+                    except Exception:
+                        pass
+                if not _migrate_legacy_db(old_db_path, db_path):
+                    open_path = old_db_path
+            else:
+                print(f"⚠️ Legacy database found at {old_db_path}")
+                print(f"   alongside existing {db_path} (which has data).")
+                print(f"   The legacy file was NOT migrated. If your history is missing,")
+                print(f"   stop the bot and move the legacy file into place manually.")
+
+    db = sqlite3.connect(str(open_path))
     cursor = db.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
@@ -49,6 +196,22 @@ def init_database():
     return db
 
 
+def get_db(companion_name="default"):
+    """
+    Returns the sqlite connection context for a specific companion.
+    Normalizes connections dynamically on-the-fly.
+    """
+    global _db_connections
+    if not companion_name:
+        companion_name = "default"
+
+    # Normalize name
+    normalized = companion_name.strip().lower()
+    if normalized not in _db_connections:
+        _db_connections[normalized] = init_database(companion_name)
+    return _db_connections[normalized]
+
+
 def save_message(db, channel, role, content, name=None):
     cursor = db.cursor()
     cursor.execute(
@@ -57,15 +220,34 @@ def save_message(db, channel, role, content, name=None):
         (datetime.now().isoformat(), channel, role, name, content)
     )
     db.commit()
+    # Return the new row's id so callers can scope subsequent history reads
+    # to messages that existed *before* this one (see get_recent_messages'
+    # before_id param). This prevents the just-saved turn from appearing
+    # twice in an LLM payload that also appends it explicitly.
+    return cursor.lastrowid
 
 
-def get_recent_messages(db, channel):
+def get_recent_messages(db, channel, before_id=None):
+    # When `before_id` is provided, only rows with id < before_id are
+    # returned. This lets a caller that has just saved the current turn
+    # load the history that existed prior to that save, avoiding a
+    # duplicate when it then appends the current turn itself. Messages
+    # saved concurrently by other handlers (with higher ids) are also
+    # excluded, so each turn sees the conversation strictly as-of when
+    # it arrived — no seeing-the-future, no gaps, no misordering.
     cursor = db.cursor()
-    cursor.execute(
-        "SELECT role, name, content FROM messages "
-        "WHERE channel = ? ORDER BY id",
-        (channel,)
-    )
+    if before_id is None:
+        cursor.execute(
+            "SELECT role, name, content FROM messages "
+            "WHERE channel = ? ORDER BY id",
+            (channel,)
+        )
+    else:
+        cursor.execute(
+            "SELECT role, name, content FROM messages "
+            "WHERE channel = ? AND id < ? ORDER BY id",
+            (channel, before_id)
+        )
     rows = cursor.fetchall()
     messages = []
     for role, name, content in rows:
@@ -80,6 +262,115 @@ def get_recent_messages(db, channel):
                 "content": f"{content}"
             })
     return messages
+
+
+def get_registry_channel_setting(channel, param, default=None):
+    # Cross-companion per-channel setting stored in registry.db.
+    conn = get_registry_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT value FROM registry_channel_settings WHERE channel = ? AND param = ?",
+        (channel, param)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else default
+
+
+def set_registry_channel_setting(channel, param, value):
+    conn = get_registry_db()
+    conn.execute(
+        "INSERT INTO registry_channel_settings (channel, param, value) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(channel, param) DO UPDATE SET value = excluded.value",
+        (channel, param, value)
+    )
+    conn.commit()
+
+
+def clear_registry_channel_setting(channel, param):
+    conn = get_registry_db()
+    conn.execute(
+        "DELETE FROM registry_channel_settings WHERE channel = ? AND param = ?",
+        (channel, param)
+    )
+    conn.commit()
+    return conn.total_changes > 0
+
+
+def list_registry_channel_settings_by_prefix(channel, prefix):
+    conn = get_registry_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT param, value FROM registry_channel_settings "
+        "WHERE channel = ? AND param LIKE ? ORDER BY param",
+        (channel, f"{prefix}%"),
+    )
+    return cursor.fetchall()
+
+
+def get_registry_global_var(param):
+    conn = get_registry_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM registry_global_vars WHERE param = ?", (param,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def set_registry_global_var(param, value):
+    conn = get_registry_db()
+    conn.execute(
+        "INSERT INTO registry_global_vars (timestamp, param, value) VALUES (?, ?, ?) "
+        "ON CONFLICT(param) DO UPDATE SET "
+        "value = excluded.value, timestamp = excluded.timestamp",
+        (datetime.now().isoformat(), param, value)
+    )
+    conn.commit()
+
+
+def delete_registry_global_var(param):
+    conn = get_registry_db()
+    conn.execute("DELETE FROM registry_global_vars WHERE param = ?", (param,))
+    conn.commit()
+    return conn.total_changes > 0
+
+
+def list_registry_global_vars(param_prefix=None):
+    conn = get_registry_db()
+    cursor = conn.cursor()
+    if param_prefix:
+        cursor.execute(
+            "SELECT param, value FROM registry_global_vars WHERE param LIKE ? ORDER BY param",
+            (f"{param_prefix}%",)
+        )
+    else:
+        cursor.execute("SELECT param, value FROM registry_global_vars ORDER BY param")
+    return cursor.fetchall()
+
+
+# --- social_mode (cross-companion; stored in registry.db) ---
+
+def is_social_mode(channel_name):
+    return get_registry_channel_setting(channel_name, "social_mode", "0") == "1"
+
+
+def set_social_mode(channel_name):
+    set_registry_channel_setting(channel_name, "social_mode", "1")
+
+
+def clear_social_mode(channel_name):
+    clear_registry_channel_setting(channel_name, "social_mode")
+
+
+def get_social_mode_focus(guild_name):
+    return get_registry_global_var(f"social_mode_focus::{guild_name}")
+
+
+def set_social_mode_focus(guild_name, channel_name):
+    set_registry_global_var(f"social_mode_focus::{guild_name}", channel_name)
+
+
+def clear_social_mode_focus(guild_name):
+    delete_registry_global_var(f"social_mode_focus::{guild_name}")
 
 
 def get_anchored_memories(db, channel_name):
@@ -118,6 +409,18 @@ def remove_anchored_memory(db, memory_id):
     return cursor.rowcount > 0
 
 
+def update_anchored_memory(db, memory_id, content):
+    # Replace an existing anchored memory's content and refresh its timestamp.
+    # Returns True if a row with that id existed and was updated; False otherwise.
+    cursor = db.cursor()
+    cursor.execute(
+        "UPDATE anchored_memories SET content = ?, timestamp = ? WHERE id = ?",
+        (content, datetime.now().isoformat(), memory_id)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+
 def list_anchored_memories(db, channel_name):
     # List memories for display: globals first, then channel-specific.
     cursor = db.cursor()
@@ -132,12 +435,54 @@ def list_anchored_memories(db, channel_name):
 
 def rename_channel(db, old_name, new_name):
     cursor = db.cursor()
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM messages WHERE channel = ?",
+        (old_name,)
+    )
+    if cursor.fetchone()[0] == 0:
+        return {"messages": 0, "settings": 0, "anchors": 0}
+
+    cursor.execute(
+        "DELETE FROM channel_settings WHERE channel = ?",
+        (new_name,)
+    )
+    cursor.execute(
+        "DELETE FROM anchored_memories WHERE channel = ? AND channel != 'global'",
+        (new_name,)
+    )
+
+    cursor.execute(
+        "UPDATE channel_settings SET channel = ? WHERE channel = ?",
+        (new_name, old_name)
+    )
+    settings_count = cursor.rowcount
+
+    cursor.execute(
+        "UPDATE anchored_memories SET channel = ? WHERE channel = ? AND channel != 'global'",
+        (new_name, old_name)
+    )
+    anchors_count = cursor.rowcount
+
     cursor.execute(
         "UPDATE messages SET channel = ? WHERE channel = ?",
         (new_name, old_name)
     )
+    messages_count = cursor.rowcount
+
     db.commit()
-    return cursor.rowcount
+
+    try:
+        conn = get_registry_db()
+        conn.execute(
+            "UPDATE channel_registry SET channel = ? WHERE channel = ?",
+            (new_name, old_name)
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+    return {"messages": messages_count, "settings": settings_count, "anchors": anchors_count}
 
 
 def prune_orphan_channels(db, live_channel_names, min_age_days=5):
@@ -206,25 +551,25 @@ def prune_orphan_channels(db, live_channel_names, min_age_days=5):
 
     del_placeholders = ",".join("?" * len(safe_to_delete))
 
-    cursor.execute(
-        f"DELETE FROM messages WHERE channel IN ({del_placeholders})",
-        safe_to_delete,
-    )
-    msg_removed = cursor.rowcount
+    with db:
+        cursor.execute(
+            f"DELETE FROM messages WHERE channel IN ({del_placeholders})",
+            safe_to_delete,
+        )
+        msg_removed = cursor.rowcount
 
-    cursor.execute(
-        f"DELETE FROM channel_settings WHERE channel IN ({del_placeholders})",
-        safe_to_delete,
-    )
-    settings_removed = cursor.rowcount
+        cursor.execute(
+            f"DELETE FROM channel_settings WHERE channel IN ({del_placeholders})",
+            safe_to_delete,
+        )
+        settings_removed = cursor.rowcount
 
-    cursor.execute(
-        f"DELETE FROM anchored_memories WHERE channel != 'global' AND channel IN ({del_placeholders})",
-        safe_to_delete,
-    )
-    anchors_removed = cursor.rowcount
+        cursor.execute(
+            f"DELETE FROM anchored_memories WHERE channel != 'global' AND channel IN ({del_placeholders})",
+            safe_to_delete,
+        )
+        anchors_removed = cursor.rowcount
 
-    db.commit()
     return (msg_removed, settings_removed, anchors_removed)
 
 
@@ -318,6 +663,13 @@ def list_channel_settings_by_prefix(db, channel, prefix):
         (channel, f"{prefix}%"),
     )
     return cursor.fetchall()
+
+
+def reset_channel_settings(db, channel):
+    cursor = db.cursor()
+    cursor.execute("DELETE FROM channel_settings WHERE channel = ?", (channel,))
+    db.commit()
+    return cursor.rowcount
 
 
 def reset_all_channel_settings(db, param=None):
