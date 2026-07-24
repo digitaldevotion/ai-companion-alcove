@@ -152,6 +152,10 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
             provider_lock = lock_match.group(1) if lock_match else None
             new_model = raw_arg[:lock_match.start()].strip() if lock_match else raw_arg
             set_channel_setting(db, channel_name, "text_model", new_model)
+            # Invalidate any persisted per-channel context limit so the next
+            # resolve re-runs auto-adjust against the new model (or falls back
+            # to MAX_CONTEXT_TOKENS when auto-adjust is off / lookup fails).
+            clear_channel_setting(db, channel_name, "context_token_limit")
             if provider_lock:
                 set_channel_setting(db, channel_name, "text_provider_lock", provider_lock)
             else:
@@ -165,39 +169,34 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
             if auto_context_adjust:
                 try:
                     model_ctx = await provider.get_model_context_length(new_model)
-                    if model_ctx:
-                        buffer = 10000
+                    if model_ctx and model_ctx > 10000:
+                        buffer = max(10000, int(model_ctx * 0.07))
                         new_limit = model_ctx - buffer
-                        if new_limit < buffer:
-                            await message.channel.send(
-                                f"*⚠️ Model context length ({model_ctx:,}) is too small to auto-adjust.*"
-                            )
-                        else:
-                            set_channel_setting(db, channel_name, "context_token_limit", str(new_limit))
+                        set_channel_setting(db, channel_name, "context_token_limit", str(new_limit))
 
-                            # Calculate current usage to report headroom
-                            main_block = build_llm_main_prompt(db, channel_name, memory_enabled=effective_memory, anchors_enabled=effective_anchors, social_mode=is_social_mode(channel_name))
-                            history = build_trimmed_history_for_payload(
-                                db, channel_name, main_block, context_limit=new_limit,
-                                channel_key=channel_name, model=current_text_model
-                            )
-                            full_messages = compose_full_messages(main_block, history)
-                            used_tokens = sum(msg_tokens(m, channel_key=channel_name) for m in full_messages)
-                            remaining = new_limit - used_tokens
+                        # Calculate current usage to report headroom
+                        main_block = build_llm_main_prompt(db, channel_name, memory_enabled=effective_memory, anchors_enabled=effective_anchors, social_mode=is_social_mode(channel_name))
+                        history = build_trimmed_history_for_payload(
+                            db, channel_name, main_block, context_limit=new_limit,
+                            channel_key=channel_name, model=current_text_model
+                        )
+                        full_messages = compose_full_messages(main_block, history)
+                        used_tokens = sum(msg_tokens(m, channel_key=channel_name) for m in full_messages)
+                        remaining = new_limit - used_tokens
 
-                            ctx_msg = (
-                                f"*📐 Auto-adjusted context limit to **{new_limit:,}** "
-                                f"(model max {model_ctx:,} − {buffer:,} buffer).\n"
-                                f"Current usage: ~{used_tokens:,} tokens — "
-                                f"**~{remaining:,}** tokens remaining.*"
+                        ctx_msg = (
+                            f"*📐 Auto-adjusted context limit to **{new_limit:,}** "
+                            f"(model max {model_ctx:,} − {buffer:,} buffer).\n"
+                            f"Current usage: ~{used_tokens:,} tokens — "
+                            f"**~{remaining:,}** tokens remaining.*"
+                        )
+                        if remaining < 0:
+                            ctx_msg += (
+                                f"\n*⚠️ Current session history exceeds the new limit by "
+                                f"~{abs(remaining):,} tokens. Older messages will be "
+                                f"trimmed from context on the next prompt.*"
                             )
-                            if remaining < 0:
-                                ctx_msg += (
-                                    f"\n*⚠️ Current session history exceeds the new limit by "
-                                    f"~{abs(remaining):,} tokens. Older messages will be "
-                                    f"trimmed from context on the next prompt.*"
-                                )
-                            await message.channel.send(ctx_msg)
+                        await message.channel.send(ctx_msg)
                     else:
                         await message.channel.send(
                             f"*ℹ️ No context length found for `{new_model}` on {provider.provider_name()} — context limit unchanged.*"
@@ -352,6 +351,7 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
         count += reset_all_channel_settings(db, "voice_text_model")
         count += reset_all_channel_settings(db, "text_provider_lock")
         count += reset_all_channel_settings(db, "voice_text_provider_lock")
+        count += reset_all_channel_settings(db, "context_token_limit")
         await message.channel.send(
             f"*Reset all channels to default text model ({count} overrides removed).*\n"
             f"*Text: **{config.CURRENT_TEXT_MODEL}***"
@@ -391,51 +391,6 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
             f"*Cleared all channel settings for `{channel_name}` ({removed} entries removed). "
             f"All defaults will now apply.*"
         )
-        return True
-
-    if cmd.startswith("!contextlimit"):
-        parts = content.split(maxsplit=1)
-        if len(parts) > 1:
-            raw = parts[1].strip().replace(",", "").replace("_", "")
-            try:
-                new_limit = int(raw)
-            except ValueError:
-                await message.channel.send(
-                    f"*Could not parse **{parts[1].strip()}** as an integer.*"
-                )
-                return True
-            if new_limit <= 0:
-                await message.channel.send("*Context limit must be positive.*")
-                return True
-            # Measure current system prompt for this channel
-            main_block = build_llm_main_prompt(db, channel_name, memory_enabled=effective_memory, anchors_enabled=effective_anchors, social_mode=is_social_mode(channel_name))
-            system_tokens = sum(estimate_tokens(b["text"], channel_key=channel_name) for b in main_block)
-            if new_limit <= system_tokens:
-                await message.channel.send(
-                    f"*Refusing to set limit to **{new_limit:,}**: the system prompt alone "
-                    f"is **~{system_tokens:,}** tokens right now "
-                    f"(memory {'on' if effective_memory else 'off'}). "
-                    f"Pick a value above that.*"
-                )
-                return True
-            set_channel_setting(db, channel_name, "context_token_limit", str(new_limit))
-            headroom = new_limit - system_tokens
-            warning = ""
-            if headroom < 2000:
-                warning = (
-                    f"\n*⚠ Only **~{headroom:,}** tokens left for history after the system "
-                    f"prompt (~{system_tokens:,}). History will be trimmed aggressively.*"
-                )
-            await message.channel.send(
-                f"*Set context token limit for `{channel_name}` to **{new_limit:,}**.*"
-                f"{warning}"
-            )
-        else:
-            await message.channel.send(
-                f"*Context limit for `{channel_name}`: **{current_context_limit:,}** "
-                f"(default **{config.MAX_CONTEXT_TOKENS:,}**). "
-                f"Usage: `!contextLimit <N>`*"
-            )
         return True
 
     if cmd.startswith("!diag69105"):
@@ -536,14 +491,6 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
         await message.channel.send(
             f"*Reset all channels to default reasoning effort ({count} overrides removed).*\n"
             f"*Default: **{config.REASONING_LEVEL}***"
-        )
-        return True
-
-    if cmd == "!resetcontextlimit":
-        count = reset_all_channel_settings(db, "context_token_limit")
-        await message.channel.send(
-            f"*Reset all channels to default context limit ({count} overrides removed).*\n"
-            f"*Default: **{config.MAX_CONTEXT_TOKENS:,}***"
         )
         return True
 
@@ -1190,7 +1137,7 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
                 f"*File: ~{new_file_tokens:,} tokens · current system block: ~{current_system_tokens:,} · "
                 f"reserve: {REPLY_RESERVE:,} · limit: {current_context_limit:,} "
                 f"(**over by ~{over:,} tokens**).*\n"
-                f"*Unload something with `!unload`, raise the limit with `!contextLimit`, "
+                f"*Unload something with `!unload`, "
                 f"or switch to a larger-context model.*"
             )
             return True
@@ -1754,8 +1701,7 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
             "`!resetModel` — reset text model to default across ALL channels\n"
             "`!resetImageModel` — reset image model to default across ALL channels\n"
             "`!resetVoiceTextModel` — reset voice text model to default across ALL channels\n"
-            "`!resetVoiceModelID` — reset ElevenLabs voice ID to default across ALL channels\n"
-            "`!resetContextLimit` — reset context limit to default across all channels",
+            "`!resetVoiceModelID` — reset ElevenLabs voice ID to default across ALL channels\n",
 
             # Group 2: Context + Images + Memory & Knowledge
             "────────────────────\n"

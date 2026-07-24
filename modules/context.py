@@ -85,23 +85,41 @@ async def _resolve_settings(db, channel_name, memory_enabled, search_references_
 
 
 async def _resolve_context_limit(db, channel_name, text_model, auto_context=True):
+    _max = config.MAX_CONTEXT_TOKENS
+
+    # Feature disabled entirely → MAX wins, ignore any persisted auto-cache row.
+    if not config.AUTO_CONTEXT_ADJUST:
+        return _max
+
+    # Feature enabled. A persisted row from a prior successful lookup wins
+    # (no network call needed). Unparseable rows are treated as missing so
+    # they self-heal on the next successful provider lookup.
     _raw_context_limit = get_channel_setting(db, channel_name, "context_token_limit")
     if _raw_context_limit is not None:
-        return int(_raw_context_limit)
-    if auto_context and config.AUTO_CONTEXT_ADJUST:
-        current_context_limit = config.MAX_CONTEXT_TOKENS
         try:
-            _model_ctx = await provider.get_model_context_length(text_model)
-            if _model_ctx and _model_ctx > 10000:
-                _reserve = max(10000, int(_model_ctx * 0.07))
-                current_context_limit = _model_ctx - _reserve
-                set_channel_setting(db, channel_name, "context_token_limit", str(current_context_limit))
-                print(f"📐 [{channel_name}] Auto-set context limit to {current_context_limit:,} "
-                      f"(model {text_model} max {_model_ctx:,} − {_reserve:,} buffer)")
-        except Exception as _e:
-            print(f"⚠️ [{channel_name}] Auto-context lookup failed: {_e}")
-        return current_context_limit
-    return config.MAX_CONTEXT_TOKENS
+            return int(_raw_context_limit)
+        except (TypeError, ValueError):
+            pass  # fall through to re-seed + lookup
+
+    # No usable persisted row. Callers that opt out of network lookups
+    # (idle / voice timer paths) get the fallback.
+    if not auto_context:
+        return _max
+
+    # Caller allows a lookup — seed from the fallback and refine from the
+    # provider if it reports a context length.
+    current_context_limit = _max
+    try:
+        _model_ctx = await provider.get_model_context_length(text_model)
+        if _model_ctx and _model_ctx > 10000:
+            _reserve = max(10000, int(_model_ctx * 0.07))
+            current_context_limit = _model_ctx - _reserve
+            set_channel_setting(db, channel_name, "context_token_limit", str(current_context_limit))
+            print(f"📐 [{channel_name}] Auto-set context limit to {current_context_limit:,} "
+                  f"(model {text_model} max {_model_ctx:,} − {_reserve:,} buffer)")
+    except Exception as _e:
+        print(f"⚠️ [{channel_name}] Auto-context lookup failed: {_e}")
+    return current_context_limit
 
 
 @dataclass
