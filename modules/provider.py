@@ -11,7 +11,6 @@
 
 import asyncio
 import json
-import re
 
 import aiohttp
 import config
@@ -204,14 +203,14 @@ def _sanitize_messages(messages, model, provider):
 # ── Chat Completions ─────────────────────────────────────────────────────────
 
 async def chat_completion(model, messages, temperature=None, max_tokens=0,
-                          reasoning=None, modalities=None, top_k=None,
+                          reasoning=None, top_k=None,
                           channel_key=None, provider_lock=None):
     """
     Send a chat completion request and return the raw JSON response dict.
 
     Callers are responsible for parsing the response (extracting text,
-    images, etc.) since the shape is mostly provider-agnostic (OpenAI
-    compatible) but image handling varies by model.
+    thinking content, etc.) since the shape is mostly provider-agnostic
+    (OpenAI compatible).
     """
     if temperature is None:
         temperature = config.TEMPERATURE
@@ -233,8 +232,6 @@ async def chat_completion(model, messages, temperature=None, max_tokens=0,
         payload["reasoning"] = {"effort": reasoning.lower()}
         if prov == "openrouter":
             payload["include_reasoning"] = True
-    if modalities:
-        payload["modalities"] = modalities
 
     is_anthropic = "anthropic/" in model.lower() or model.lower().startswith("claude-")
 
@@ -474,7 +471,7 @@ async def chat_completion_text_with_thinking(model, messages, temperature=None,
 # ── Image Generation ─────────────────────────────────────────────────────────
 
 # Default size sent to nanoGPT's /images/generations endpoint. OpenRouter's
-# chat-completions-based image generation doesn't use this parameter.
+# /images endpoint uses provider defaults and doesn't take this parameter.
 DEFAULT_IMAGE_SIZE = "1024x1024"
 
 
@@ -539,111 +536,67 @@ async def _generate_image_nanogpt(prompt, model, reference_images=None, provider
     return {"type": "error", "text": "*Image response had no b64_json or url field.*"}
 
 
-def _data_uri_to_base64(url):
-    """
-    Strip the scheme/mime prefix off a data: URI and return the base64
-    payload, or None if the URI is malformed (e.g. missing comma).
-    """
-    if not isinstance(url, str) or not url.startswith("data:"):
-        return None
-    if "," not in url:
-        return None
-    return url.split(",", 1)[1]
-
-
 async def _generate_image_openrouter(prompt, model, reference_images=None, provider_lock=None):
     """
-    OpenRouter tunnels image generation through chat completions with
-    modalities=["image"]. Response shape varies by model, so we
-    try several formats.
+    OpenRouter's dedicated Image API: POST /api/v1/images with a model and
+    prompt. Reference images (image-to-image) go in input_references as
+    image_url blocks — HTTP(S) or base64 data URLs. Generated images come
+    back as base64 in data[].b64_json.
+
+    This endpoint serves ALL OpenRouter image models, including dedicated
+    generation models (gpt-image family, seedream, flux, grok-imagine, ...)
+    that reject the chat/completions endpoint outright with a 404.
     """
+    payload = {
+        "model": normalize_model_id(model),
+        "prompt": prompt,
+    }
+    if provider_lock:
+        payload["provider"] = {"order": [provider_lock]}
     if reference_images:
-        user_content = [{"type": "text", "text": prompt}]
-        for data_uri in reference_images:
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": data_uri}
-            })
-        messages = [{"role": "user", "content": user_content}]
-    else:
-        messages = [{"role": "user", "content": prompt}]
+        payload["input_references"] = [
+            {"type": "image_url", "image_url": {"url": data_uri}}
+            for data_uri in reference_images
+        ]
 
-    data = await chat_completion(
-        model,
-        messages,
-        modalities=["image"],
-        provider_lock=provider_lock,
-    )
-
-    # --- Error envelopes (ours or upstream) ----------------------------
-    if data.get("error"):
-        status, detail = _extract_error_detail(data)
-        prefix = f"Error {status}" if status else "Error"
-        return {"type": "error", "text": f"*{prefix}: {detail}*"}
-
-    # --- Guard the choices/message chain -------------------------------
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
+    try:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+            async with session.post(
+                f"{_base_url()}/images",
+                headers=_headers(),
+                json=payload,
+            ) as response:
+                if response.status != 200:
+                    body_text = await response.text()
+                    detail = body_text[:500]
+                    try:
+                        _, msg = _extract_error_detail(json.loads(body_text))
+                        if msg:
+                            detail = msg
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    return {"type": "error", "text": f"*Error {response.status}: {detail}*"}
+                data = await response.json()
+    except asyncio.TimeoutError:
         return {"type": "error",
-                "text": "*Image model returned no choices (possible moderation block or empty response).*"}
-    first = choices[0] if isinstance(choices[0], dict) else {}
-    msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+                "text": f"*Image request timed out after {REQUEST_TIMEOUT.total:.0f}s*"}
+    except Exception as e:
+        return {"type": "error", "text": f"*Image request failed: {e}*"}
 
-    # Check for images array (Gemini via OpenRouter)
-    images = msg.get("images") or []
-    if images:
-        img = images[0] if isinstance(images[0], dict) else {}
-        url = (img.get("image_url") or {}).get("url", "") if isinstance(img.get("image_url"), dict) else ""
-        b64 = _data_uri_to_base64(url)
-        if b64 is not None:
-            return {"type": "base64", "data": b64}
-        if url:
-            return {"type": "url", "url": url}
-
-    content = msg.get("content")
-
-    # content is null — no image found
-    if content is None:
-        refusal = msg.get("refusal")
-        if refusal:
-            return {"type": "error", "text": f"*Model refused: {str(refusal)[:300]}*"}
-        return {"type": "error",
-                "text": "*Image model returned no image data. Check console for full response.*"}
-
-    # Content block format (image_url or inline_data blocks)
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "image_url":
-                url = (block.get("image_url") or {}).get("url", "") if isinstance(block.get("image_url"), dict) else ""
-                b64 = _data_uri_to_base64(url)
-                if b64 is not None:
-                    return {"type": "base64", "data": b64}
-                if url:
-                    return {"type": "url", "url": url}
-            elif block.get("type") == "inline_data":
-                payload = block.get("data")
-                if payload:
-                    return {"type": "base64", "data": payload}
-        return {"type": "error",
-                "text": "*Image model returned content blocks but no image was found.*"}
-    elif isinstance(content, str):
-        # Markdown image syntax ![...](url)
-        match = re.search(r'!\[.*?\]\((.*?)\)', content)
-        if match:
-            url = match.group(1)
-            b64 = _data_uri_to_base64(url)
-            if b64 is not None:
-                return {"type": "base64", "data": b64}
-            if url:
-                return {"type": "url", "url": url}
-        # Bare base64 data URI
-        b64 = _data_uri_to_base64(content)
-        if b64 is not None:
-            return {"type": "base64", "data": b64}
-        return {"type": "error", "text": f"*Image model returned text instead of an image: {content[:200]}*"}
-    return {"type": "error", "text": f"*Unexpected content type: {type(content).__name__}*"}
+    items = data.get("data") or []
+    if not items:
+        # 200 with no data — check for an upstream error envelope.
+        if data.get("error"):
+            status, detail = _extract_error_detail(data)
+            prefix = f"Error {status}" if status else "Error"
+            return {"type": "error", "text": f"*{prefix}: {detail}*"}
+        return {"type": "error", "text": "*Image model returned no image data.*"}
+    first = items[0] if isinstance(items[0], dict) else {}
+    if first.get("b64_json"):
+        return {"type": "base64", "data": first["b64_json"]}
+    if first.get("url"):
+        return {"type": "url", "url": first["url"]}
+    return {"type": "error", "text": "*Image response had no b64_json or url field.*"}
 
 
 # ── Credits / Balance ────────────────────────────────────────────────────────
@@ -758,7 +711,11 @@ async def get_models():
 
     For nanoGPT, this merges BOTH the chat-model list (/v1/models) and the
     image-model list (/v1/image-models), since image models live on a
-    separate endpoint there but OpenRouter exposes everything in one list.
+    separate endpoint there. For OpenRouter, this merges the general
+    catalog (/models) with the dedicated image catalog (/images/models),
+    since dedicated generation models (gpt-image family, seedream, flux,
+    grok-imagine, ...) are absent from the general catalog.
+
     This lets !diag validate configured image models without special casing.
 
     Returns an empty list on error (caller should check).
@@ -777,7 +734,28 @@ async def get_models():
         image_raw = await _fetch_model_endpoint(f"{_base_url()}/image-models")
         models.extend(_normalize_model_entry(m) for m in image_raw)
 
-    return models
+    # OpenRouter: merge image models from the dedicated Image API. Dedicated
+    # image-generation models are absent from the general /models catalog,
+    # so without this merge !diag would report configured image models as
+    # "not found".
+    if provider == "openrouter":
+        try:
+            image_raw = await _fetch_model_endpoint(f"{_base_url()}/images/models")
+            models.extend(_normalize_model_entry(m) for m in image_raw)
+        except Exception:
+            pass  # image models endpoint may not be available on all setups
+
+    # Dedupe by id — image models like the gemini-* family appear in both
+    # the general catalog and /images/models.
+    seen = set()
+    deduped = []
+    for m in models:
+        if m["id"] in seen:
+            continue
+        seen.add(m["id"])
+        deduped.append(m)
+
+    return deduped
 
 
 async def get_model_context_length(model_id):
