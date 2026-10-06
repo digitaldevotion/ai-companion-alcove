@@ -9,21 +9,37 @@
 import os
 import sys
 
-# ── Auto-activate ~/alcove-env (macOS / Linux only) ─────────────────
+# ── Auto-activate ~/alcove-env (macOS / Linux / Windows) ────────────
 # If the venv exists and we're not already inside one, re-execute this
-# script with the venv's Python.  This is equivalent to sourcing
-# bin/activate — the venv's interpreter automatically uses its own
-# site-packages, and VIRTUAL_ENV / PATH are set for any subprocesses.
-if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.base_prefix:
+# script with the venv's Python.  This is equivalent to activating the
+# venv — its interpreter automatically uses its own site-packages, and
+# VIRTUAL_ENV / PATH are set for any subprocesses.
+if not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.base_prefix:
     _venv_dir = os.path.expanduser("~/alcove-env")
-    _venv_python = os.path.join(_venv_dir, "bin", "python3")
-    if os.path.isdir(_venv_dir) and os.path.isfile(_venv_python):
+    if os.name == "nt":
+        _venv_bin = os.path.join(_venv_dir, "Scripts")
+        _venv_python = os.path.join(_venv_bin, "python.exe")
+    else:
+        _venv_bin = os.path.join(_venv_dir, "bin")
+        _venv_python = os.path.join(_venv_bin, "python3")
+    if os.path.isfile(_venv_python):
         os.environ["VIRTUAL_ENV"] = _venv_dir
-        os.environ["PATH"] = os.path.join(_venv_dir, "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
+        if os.name == "nt":
+            # Windows os.execv is not a true exec (it spawns a new process
+            # and mangles arguments containing spaces), so launch a
+            # subprocess instead and forward its exit code.
+            import subprocess
+            try:
+                completed = subprocess.run([_venv_python] + sys.argv)
+            except KeyboardInterrupt:
+                sys.exit(130)
+            sys.exit(completed.returncode)
         os.execv(_venv_python, [_venv_python] + sys.argv)
 
 import ssl
 import subprocess
+import shutil
 import time
 import urllib.request
 
@@ -38,7 +54,7 @@ import certifi
 
 config = None  # loaded dynamically after check_config_exists()
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 
 LOGO = rf"""
     _    _     ____ _____     _______
@@ -97,6 +113,21 @@ def check_credentials():
         _fail(f"{key_name} is missing or empty (provider: {prov})")
         all_good = False
 
+    # The <websearch> tool always calls OpenRouter directly (the
+    # openrouter:web_search server tool is OpenRouter-specific). When the
+    # active provider isn't OpenRouter, the OpenRouter key may be missing
+    # without blocking bot startup — but websearch would silently degrade
+    # to the keyless DuckDuckGo fallback. Warn the user so that's a
+    # conscious choice, not a surprise.
+    if prov != "openrouter":
+        or_key = getattr(config, "OPENROUTER_KEY", "") or ""
+        or_key = or_key.strip()
+        fallback = getattr(config, "WEBSEARCH_FALLBACK", "on_failure").lower()
+        if (not or_key or or_key == "REPLACE_WITH_OPENROUTER_KEY") and fallback != "off":
+            _warn("OPENROUTER_KEY is missing/placeholder — <websearch> will use "
+                  "the keyless DuckDuckGo fallback (snippet-only results). Set "
+                  "OPENROUTER_KEY or WEBSEARCH_FALLBACK=\"off\" to change this.")
+
     return all_good
 
 
@@ -118,6 +149,7 @@ def check_optional_models():
     print("\n-- Optional models --")
     optional = [
         ("CURRENT_IMAGE_MODEL", "image generation is optional — !image will return an error"),
+        ("CURRENT_VIDEO_MODEL", "video generation is optional — !video will return an error"),
         ("CURRENT_VOICE_TEXT_MODEL", "voice mode is optional — !voice features will be disabled"),
         ("ELEVENLABS_VOICE_MODEL", "voice mode is optional — !voice features will be disabled"),
     ]
@@ -127,6 +159,28 @@ def check_optional_models():
             _ok(f"{name} is set")
         else:
             _warn(f"{name} is missing or empty", note)
+    return True
+
+
+def check_ffmpeg():
+    print("\n-- ffmpeg --")
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        _ok(f"ffmpeg found → {ffmpeg_path}")
+        return True
+    elevenlabs_key = getattr(config, "ELEVENLABS_API_KEY", None)
+    if elevenlabs_key and str(elevenlabs_key).strip():
+        _fail(
+            "ffmpeg not found on PATH",
+            "ELEVENLABS_API_KEY is set, so voice is configured — ffmpeg is required. "
+            "See the Alcove OS installation manual: https://ai-alcove.neocities.org/",
+        )
+        return False
+    _warn(
+        "ffmpeg not found on PATH",
+        "voice features will be unavailable. "
+        "See the Alcove OS installation manual: https://ai-alcove.neocities.org/",
+    )
     return True
 
 
@@ -234,6 +288,7 @@ def main():
         sys.exit(1)
 
     results = [
+        check_ffmpeg(),
         check_ssl(),
         check_credentials(),
         check_optional_models(),

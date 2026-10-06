@@ -12,6 +12,7 @@
 #        - config.py
 #        - databases/companion_data.db
 #        - companion_datafiles/  (entire folder)
+#        - skills/  (personal skill folders not already present)
 #   4. Backs up the freshly copied config.py.
 #   5. Merges new config_template.py settings into config.py,
 #      preserving all existing user values.
@@ -26,13 +27,28 @@ import ast
 import os
 import sys
 
-# ── Auto-activate ~/alcove-env (macOS / Linux only) ─────────────────
-if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.base_prefix:
+# ── Auto-activate ~/alcove-env (macOS / Linux / Windows) ────────────
+if not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.base_prefix:
     _venv_dir = os.path.expanduser("~/alcove-env")
-    _venv_python = os.path.join(_venv_dir, "bin", "python3")
-    if os.path.isdir(_venv_dir) and os.path.isfile(_venv_python):
+    if os.name == "nt":
+        _venv_bin = os.path.join(_venv_dir, "Scripts")
+        _venv_python = os.path.join(_venv_bin, "python.exe")
+    else:
+        _venv_bin = os.path.join(_venv_dir, "bin")
+        _venv_python = os.path.join(_venv_bin, "python3")
+    if os.path.isfile(_venv_python):
         os.environ["VIRTUAL_ENV"] = _venv_dir
-        os.environ["PATH"] = os.path.join(_venv_dir, "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
+        if os.name == "nt":
+            # Windows os.execv is not a true exec (it spawns a new process
+            # and mangles arguments containing spaces), so launch a
+            # subprocess instead and forward its exit code.
+            import subprocess
+            try:
+                completed = subprocess.run([_venv_python] + sys.argv)
+            except KeyboardInterrupt:
+                sys.exit(130)
+            sys.exit(completed.returncode)
         os.execv(_venv_python, [_venv_python] + sys.argv)
 
 import shutil
@@ -336,6 +352,64 @@ def _run_upgrade():
                 print(f"      → {f}")
     else:
         print(f"   {DATAFILES_DIR}/ ... ⬜ not found (using defaults)")
+
+    # skills/ — copy personal skill directories from the old install. A skill
+    # folder is only copied when it does NOT already exist in the new install
+    # (so built-in / updated skills win) and its name does NOT start with
+    # "test-" (test skills are disposable and skipped on upgrade).
+    old_skills = old_dir / "skills"
+    new_skills = ROOT / "skills"
+    if old_skills.is_dir():
+        new_skills.mkdir(exist_ok=True)
+
+        def _ignore_hidden(directory, contents):
+            return [c for c in contents if c.startswith(".")]
+
+        copied_skills = []
+        skipped_skills = 0
+        for entry in sorted(old_skills.iterdir()):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if name.startswith("test-"):
+                skipped_skills += 1
+                continue
+            dest = new_skills / name
+            if dest.exists():
+                skipped_skills += 1
+                continue
+            shutil.copytree(entry, dest, ignore=_ignore_hidden)
+            copied_skills.append(name)
+
+        if copied_skills or skipped_skills:
+            print(f"   skills/ ... ", end="")
+            if copied_skills:
+                detail = f"{len(copied_skills)} copied"
+                if skipped_skills:
+                    detail += f", {skipped_skills} skipped"
+                print(f"✅ ({detail})")
+                for n in copied_skills:
+                    print(f"      → {n}")
+                files_copied += 1
+            else:
+                print(f"⬜ ({skipped_skills} skipped, none to copy)")
+        else:
+            print(f"   skills/ ... ⬜ (no skill folders in old install)")
+    else:
+        print(f"   skills/ ... ⬜ not found (using defaults)")
+
+    # *.pid files — copy any PID files (e.g. alcove.pid) from the old install
+    # so start.command can kill the previous process by PID instead of falling
+    # back to a broad pkill that may hit unrelated Alcove processes.
+    old_pid_files = sorted(old_dir.glob("*.pid"))
+    if old_pid_files:
+        print(f"   *.pid ... ", end="")
+        for pid_file in old_pid_files:
+            shutil.copy2(pid_file, ROOT / pid_file.name)
+        print(f"✅ ({len(old_pid_files)} pid file(s))")
+        files_copied += 1
+    else:
+        print(f"   *.pid ... ⬜ not found (start.command will use pkill fallback)")
 
     print(f"\n   {files_copied} item(s) copied.")
 

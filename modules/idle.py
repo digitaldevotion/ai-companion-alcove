@@ -6,13 +6,16 @@
 # ============================================
 
 import asyncio
+import io
 import aiohttp
 import random
+import re
 import time
 import traceback
 from datetime import datetime, timedelta, timezone, time as dt_time
 from pathlib import Path
 
+import discord
 import discord.ext.tasks as tasks
 
 from . import provider
@@ -21,16 +24,21 @@ from .companions import (
     get_companion_paths, _scan_dir_for_files,
     get_companion_resolved_locations, load_file_content,
 )
-from .prompt import (
+from .llm_prompt_builder import (
     _is_error_response,
+    _is_context_overflow_error,
+    _context_overflow_user_message,
+    SystemBlockOversizedError,
+    attempt_context_recovery,
     build_llm_main_prompt, build_trimmed_history_for_payload,
     compose_full_messages,
-    get_ai_response, get_image_response,
+    get_ai_response, get_image_response, get_video_response,
+    retrim_history_for_tool_round,
 )
 from .attachments import url_to_data_uri
 from .directives import process_response
 from .voice import voice_manager, text_to_speech, speech_to_text
-from .utils import safe_send, safe_send_chunked, build_channel_key, parse_channel_key, estimate_tokens, msg_tokens, tokens_to_bytes
+from .utils import safe_send, safe_send_chunked, build_channel_key, parse_channel_key, estimate_tokens, msg_tokens, tokens_to_bytes, HTTP_PIN
 from .context import resolve_channel_context_by_key
 from .database import (
     save_message, get_message_count,
@@ -220,6 +228,7 @@ def init_vector_store(db, search_mode=None, chunk_size=None):
     if search_mode == 2:
         try:
             from . import vectors
+            print("🔎 vectors: boot init requested — loading default companion reference locations...")
             default_paths = get_companion_resolved_locations(db, "_global")
             vectors.init_vector_store(
                 default_paths["SEARCH_REFERENCE_LOCATIONS"],
@@ -254,6 +263,9 @@ async def _resolve_channel_by_key(channel_key):
         for ch in guild.text_channels:
             if ch.name.lower() == chan_part:
                 return ch
+        for ch in list(guild.voice_channels) + list(guild.stage_channels):
+            if ch.name.lower() == chan_part:
+                return ch
         for th in guild.threads:
             if th.name.lower() == chan_part:
                 return th
@@ -268,6 +280,9 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
     if target_channel is None:
         print(f"⚠️ {log_label}: could not resolve channel '{channel_key}'")
         return
+    # Consume the pending-turn flag: this inference runs over full channel
+    # history and therefore subsumes any unprocessed turn(s).
+    state.NEEDS_INFERENCE.pop(channel_key, None)
 
     effective_memory = bool(getattr(config, "MEMORY_ENABLED", True))
     ctx = await resolve_channel_context_by_key(
@@ -277,21 +292,41 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
 
     locs = get_companion_resolved_locations(ctx.db, channel_key)
 
-    if state.SEARCH_REFERENCES_MODE == 2:
-        from . import vectors
-        if getattr(vectors, "_active_companion_name", None) != ctx.active_companion:
-            print(f"🔎 Dynamically reloading vector DB for companion '{ctx.active_companion}'")
-            vectors.init_vector_store(
-                locs["SEARCH_REFERENCE_LOCATIONS"],
-                companion_name=ctx.active_companion,
-            )
+    # Autonomous contexts (idle/dream/note) block `runcmd` for host safety —
+    # the companion must not run arbitrary shell commands while no user is
+    # present to approve. Tasks (task#/task_once#, via cron.py) are
+    # user-configured and keep `runcmd` enabled. The flag is threaded into
+    # build_llm_main_prompt (hides run_cmd.md from the tool spec) and
+    # process_response (executor refuses any hallucinated <runcmd>).
+    _block_runcmd = log_label in ("dream_tick", "idle_action_tick", "idle_note_tick")
 
-    main_block = build_llm_main_prompt(ctx.db, channel_key, memory_enabled=ctx.effective_memory, anchors_enabled=ctx.effective_anchors, social_mode=ctx.social_mode)
-    history = build_trimmed_history_for_payload(
-        ctx.db, channel_key, main_block, context_limit=ctx.current_context_limit,
-        channel_key=channel_key, model=ctx.current_text_model
-    )
+    # DESIGN NOTE — idle / dream / random-thought ticks deliberately
+    # use the FULL main-prompt + full-history pipeline (same path as a
+    # real user turn), not a stripped/lightweight inference path. This
+    # is intentional: background self-talk must stay connected to the
+    # companion's persona, knowledge, and the recent conversation, or it
+    # produces hollow output disconnected from the relationship. The
+    # per-tick cost of a full-context call is the price of that
+    # continuity. Random-thought instructions saved as `user`/`system`
+    # rows in the DB (further down in this function) are also
+    # intentional — they become part of the session record the
+    # companion reasons over. Do not replace with a context-stripped
+    # path.
+    main_block, _ = build_llm_main_prompt(ctx.db, channel_key, memory_enabled=ctx.effective_memory, anchors_enabled=ctx.effective_anchors, social_mode=ctx.social_mode, block_runcmd=_block_runcmd)
+    try:
+        history = build_trimmed_history_for_payload(
+            ctx.db, channel_key, main_block, context_limit=ctx.current_context_limit,
+            channel_key=channel_key, model=ctx.current_text_model
+        )
+    except SystemBlockOversizedError as e:
+        print(f"🚫 [{log_label}] {e}")
+        try:
+            await safe_send_chunked(target_channel, e.format_user_message())
+        except Exception:
+            pass
+        return
     full_messages = compose_full_messages(main_block, history)
+    history_end_idx = len(history)
 
     now = datetime.now(tz=timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
     day_name = now.strftime("%A")
@@ -303,27 +338,74 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
         "content": f"{time_str} {day_name} {date_str}: {prompt_text}",
     })
 
+    # Pre-flight context enforcement: the prompt append above was never
+    # budgeted by the history trim, and estimator drift can push the
+    # assembled payload past the endpoint's real limit. Re-trim the final
+    # payload (FIFO over DB history) before the first inference call —
+    # same pattern as the interactive text path in main.py.
+    _pre_flight_idx = history_end_idx
+    history_end_idx = retrim_history_for_tool_round(
+        full_messages, history_end_idx, ctx.current_context_limit,
+        channel_key, ctx.current_text_model,
+    )
+    if history_end_idx < _pre_flight_idx:
+        print(f"✂️ [{log_label}] Pre-flight context trim: dropped "
+              f"{_pre_flight_idx - history_end_idx} history message(s) to fit "
+              f"the {ctx.current_context_limit:,}-token limit")
+
     response_text, _ = await get_ai_response(
         full_messages, model=ctx.current_text_model, reasoning_effort=ctx.current_reasoning_effort,
         temperature=ctx.current_temperature, top_k=ctx.current_top_k,
         channel_key=channel_key,
         provider_lock=ctx.current_text_provider_lock,
+        debug_enabled=ctx.debug_enabled,
     )
+
+    if _is_context_overflow_error(response_text):
+        print(f"🚫 [{log_label}] Context window exceeded: {response_text[:200]}")
+        # Self-heal (parity with llm_loop): snap calibration, correct the
+        # channel limit from the endpoint's reported truth, re-trim, retry once.
+        recovered, history_end_idx = attempt_context_recovery(
+            full_messages, history_end_idx, ctx, response_text,
+            model=ctx.current_text_model,
+        )
+        if recovered:
+            print(f"🔁 [{log_label}] Retrying once after context-overflow self-heal…")
+            response_text, _ = await get_ai_response(
+                full_messages, model=ctx.current_text_model, reasoning_effort=ctx.current_reasoning_effort,
+                temperature=ctx.current_temperature, top_k=ctx.current_top_k,
+                channel_key=channel_key,
+                provider_lock=ctx.current_text_provider_lock,
+                debug_enabled=ctx.debug_enabled,
+            )
+        if _is_context_overflow_error(response_text):
+            print(f"🚫 [{log_label}] Context window still exceeded after "
+                  f"self-heal: {response_text[:200]}")
+            try:
+                await safe_send_chunked(target_channel, _context_overflow_user_message())
+            except Exception:
+                pass
+            return
 
     async def channel_image_handler(prompt, reference_images=None):
         return await get_image_response(prompt, model=ctx.current_image_model, reference_images=reference_images, provider_lock=ctx.current_image_provider_lock)
 
-    display_text, runcmd_results, readweb_results, readimage_results, _, _ = await process_response(
+    async def channel_video_handler(prompt, reference_images=None, reference_videos=None, seconds=None):
+        return await get_video_response(prompt, model=ctx.current_video_model, reference_images=reference_images, reference_videos=reference_videos, seconds=seconds, provider_lock=ctx.current_video_provider_lock)
+
+    display_text, runcmd_results, readweb_results, readimage_results, websearch_results, readskill_results, _, _, had_journal_write = await process_response(
         response_text, target_channel,
-        image_handler=channel_image_handler, db=ctx.db,
+        image_handler=channel_image_handler, video_handler=channel_video_handler, db=ctx.db,
         active_companion=ctx.active_companion,
         send_func=safe_send,
         channel_name=channel_key,
+        anchor_review_ctx=ctx,
+        block_runcmd=_block_runcmd,
     )
 
     # --- Tool-chain follow-up loop (same pattern as on_message) ---
     tool_round = 0
-    while (runcmd_results or readweb_results or readimage_results) and tool_round < config.MAX_TOOL_ROUNDS:
+    while (runcmd_results or readweb_results or readimage_results or websearch_results or readskill_results) and tool_round < config.MAX_TOOL_ROUNDS:
         tool_round += 1
 
         if tool_round == 1 and display_text:
@@ -335,6 +417,7 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
         token_budget = ctx.current_context_limit - prompt_tokens
         runcmd_cap = tokens_to_bytes(token_budget, channel_key=channel_key) if config.MAXIMIZE_AVAILABLE_CONTEXT else 16384
         readweb_cap = tokens_to_bytes(token_budget, channel_key=channel_key) if config.MAXIMIZE_AVAILABLE_CONTEXT else 4000
+        websearch_cap = tokens_to_bytes(token_budget, channel_key=channel_key) if config.MAXIMIZE_AVAILABLE_CONTEXT else 4000
         for r in runcmd_results:
             status = "SUCCESS" if r["success"] else "FAILED"
             output = r["output"] if len(r["output"]) <= runcmd_cap else r["output"][:runcmd_cap] + "... (truncated)"
@@ -343,6 +426,10 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
             status = "SUCCESS" if r["success"] else "FAILED"
             output = r["output"] if len(r["output"]) <= readweb_cap else r["output"][:readweb_cap] + "... (truncated)"
             result_lines.append(f"🌐 {r['url']}\n[{status}]\n{output}")
+        for r in websearch_results:
+            status = "SUCCESS" if r["success"] else "FAILED"
+            output = r["output"] if len(r["output"]) <= websearch_cap else r["output"][:websearch_cap] + "... (truncated)"
+            result_lines.append(f"🔍 {r['query']}\n[{status}]\n{output}")
         attached_image_urls = []
         for r in readimage_results:
             if r["success"]:
@@ -350,6 +437,9 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
                 attached_image_urls.append(r["image_url"])
             else:
                 result_lines.append(f"🖼️ {r['source']}\n[FAILED]\n{r['error']}")
+        for r in readskill_results:
+            status = "SUCCESS" if r["success"] else "FAILED"
+            result_lines.append(f"📖 {r['path']}\n[{status}]\n{r['output']}")
         results_summary = "\n\n".join(result_lines)
         tool_user_text = f"Tool responses:\n\n{results_summary}"
 
@@ -377,6 +467,15 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
             save_message(ctx.db, channel_key, "assistant", response_text)
         save_message(ctx.db, channel_key, "user", tool_user_text, "system")
 
+        # Re-trim DB history to make room for the appended tool output —
+        # parity with llm_loop's tool-round handling (idle's copy of this
+        # loop historically lacked the retrim, so tool output could push
+        # the payload past the context limit).
+        history_end_idx = retrim_history_for_tool_round(
+            full_messages, history_end_idx, ctx.current_context_limit,
+            channel_key, ctx.current_text_model,
+        )
+
         print(f"🔁 [{log_label}] Round {tool_round}/{config.MAX_TOOL_ROUNDS}: "
               f"sending tool output back to model for follow-up response...")
         followup_text, _ = await get_ai_response(
@@ -384,15 +483,17 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
             temperature=ctx.current_temperature, top_k=ctx.current_top_k,
             channel_key=channel_key,
             provider_lock=ctx.current_text_provider_lock,
+            debug_enabled=ctx.debug_enabled,
         )
 
-        followup_display, runcmd_results, readweb_results, readimage_results, _, _ = await process_response(
+        followup_display, runcmd_results, readweb_results, readimage_results, websearch_results, readskill_results, _, _, _ = await process_response(
             followup_text, target_channel,
-            image_handler=channel_image_handler, db=ctx.db,
+            image_handler=channel_image_handler, video_handler=channel_video_handler, db=ctx.db,
             active_companion=ctx.active_companion,
             suppress_reacts=True,
             send_func=safe_send,
             channel_name=channel_key,
+            block_runcmd=_block_runcmd,
         )
         if followup_display:
             await safe_send_chunked(target_channel, followup_display)
@@ -406,6 +507,18 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
 
     if display_text:
         await safe_send_chunked(target_channel, display_text)
+
+    # Fire the anchored-memory review AFTER the main response has been saved to
+    # the DB, so the review turns are appended in correct chronological order.
+    # Applies to idle/dream ticks that wrote to the journal via
+    # <autojournal>/<permjournal> directives.
+    if had_journal_write:
+        from .anchor_review import run_anchor_review
+        await run_anchor_review(
+            ctx, target_channel,
+            prior_response_text=response_text,
+            send_func=safe_send,
+        )
 
     # --- Optional Dream Image Generation ---
     dream_image_enabled = getattr(config, "DREAM_STATE_GENERATE_IMAGE", False)
@@ -432,14 +545,17 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
                 temperature=ctx.current_temperature, top_k=ctx.current_top_k,
                 channel_key=channel_key,
                 provider_lock=ctx.current_text_provider_lock,
+                debug_enabled=ctx.debug_enabled,
             )
 
-            followup_display_text, _, _, _, _, _ = await process_response(
+            followup_display_text, _, _, _, _, _, _, _, dream_had_journal_write = await process_response(
                 followup_response, target_channel,
-                image_handler=channel_image_handler, db=ctx.db,
+                image_handler=channel_image_handler, video_handler=channel_video_handler, db=ctx.db,
                 active_companion=ctx.active_companion,
                 send_func=safe_send,
                 channel_name=channel_key,
+                anchor_review_ctx=ctx,
+                block_runcmd=_block_runcmd,
             )
 
             if not _is_error_response(followup_response):
@@ -449,6 +565,14 @@ async def _run_idle_prompt(channel_key, prompt_text, log_label, companion_name=N
 
             if followup_display_text:
                 await safe_send_chunked(target_channel, followup_display_text)
+
+            if dream_had_journal_write:
+                from .anchor_review import run_anchor_review
+                await run_anchor_review(
+                    ctx, target_channel,
+                    prior_response_text=followup_response,
+                    send_func=safe_send,
+                )
         except Exception as e:
             print(f"⚠️ Failed to generate follow-up dream image: {e}")
 
@@ -465,6 +589,9 @@ async def _run_random_thought_prompt(channel_key, companion_name=None):
     if target_channel is None:
         print(f"⚠️ random_thought: could not resolve channel '{channel_key}'")
         return
+    # Consume the pending-turn flag: this inference runs over full channel
+    # history and therefore subsumes any unprocessed turn(s).
+    state.NEEDS_INFERENCE.pop(channel_key, None)
 
     effective_memory = bool(getattr(config, "MEMORY_ENABLED", True))
     ctx = await resolve_channel_context_by_key(
@@ -472,19 +599,50 @@ async def _run_random_thought_prompt(channel_key, companion_name=None):
         companion_name=companion_name,
     )
 
-    main_block = build_llm_main_prompt(ctx.db, channel_key, memory_enabled=ctx.effective_memory, anchors_enabled=ctx.effective_anchors, social_mode=ctx.social_mode)
-    history = build_trimmed_history_for_payload(
-        ctx.db, channel_key, main_block, context_limit=ctx.current_context_limit,
-        channel_key=channel_key, model=ctx.current_text_model
-    )
+    # Decide whether to also speak this follow-up via TTS. Conditions:
+    # (1) the bot is currently connected to a voice channel in the target
+    #     channel's guild (DMs have no guild → skipped), AND
+    # (2) the most recent user-driven reply in this channel was spoken
+    #     via TTS (i.e. the user sent a voice message that was replied to
+    #     in voice).
+    # If either is false, fall back to text-only behavior using the
+    # channel's regular text model (matching the prior behavior).
+    speak_voice = False
+    target_guild = getattr(target_channel, "guild", None)
+    if target_guild is not None:
+        from .voice import voice_manager
+        if voice_manager.is_connected(guild=target_guild) \
+                and state.LAST_REPLY_WAS_VOICE_BY_CHANNEL.get(channel_key, False):
+            speak_voice = True
+
+    # DESIGN NOTE — same rationale as _run_idle_prompt above: the
+    # random-thought path intentionally uses the full main-prompt +
+    # full-history pipeline so the companion's spontaneous thoughts stay
+    # grounded in persona and recent conversation. Not a lightweight
+    # inference path. Like other autonomous contexts, `runcmd` is blocked
+    # here (block_runcmd=True) — the companion is extending its own prior
+    # reply and has no need for shell execution.
+    main_block, _ = build_llm_main_prompt(ctx.db, channel_key, memory_enabled=ctx.effective_memory, anchors_enabled=ctx.effective_anchors, social_mode=ctx.social_mode, block_runcmd=True)
+    try:
+        history = build_trimmed_history_for_payload(
+            ctx.db, channel_key, main_block, context_limit=ctx.current_context_limit,
+            channel_key=channel_key, model=ctx.current_text_model
+        )
+    except SystemBlockOversizedError as e:
+        print(f"🚫 [random_thought] {e}")
+        try:
+            await safe_send_chunked(target_channel, e.format_user_message())
+        except Exception:
+            pass
+        return
     full_messages = compose_full_messages(main_block, history)
 
-    max_words = getattr(state, "RANDOM_THOUGHT_MAX_WORDS", 200)
-    instruction = (
-        f"Without acknowledging this instruction, seamlessly continue your previous "
-        f"response by briefly introducing a random thought, stroke of genius, or "
-        f"moment of inspiration that just crossed your mind. Keep it under {max_words} "
-        f"words. Do not announce that you are doing this — just weave it in naturally."
+    max_words = getattr(state, "RANDOM_THOUGHT_MAX_WORDS", 300)
+    instruction = ( 
+        f"""Without acknowledging this instruction, add more to your last response by introducing either a new highly-relevant 
+        observation or a new highly-relevant piece of information, your top recommendation (if you haven't already) 
+        if you were brainstorming ideas, a epiphany or new highly-useful observation or thought related to your last response. 
+        Keep it under {max_words} words. Do not announce that you are doing this — just weave it in naturally.s """
     )
 
     now = datetime.now(tz=timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
@@ -497,18 +655,62 @@ async def _run_random_thought_prompt(channel_key, companion_name=None):
         "content": f"{time_str} {day_name} {date_str}: {instruction}",
     })
 
+    # Pre-flight context enforcement (parity with _run_idle_prompt / main.py):
+    # the instruction append above was never budgeted by the history trim.
+    _rt_history_end_idx = len(history)
+    _rt_pre_idx = _rt_history_end_idx
+    _rt_history_end_idx = retrim_history_for_tool_round(
+        full_messages, _rt_history_end_idx, ctx.current_context_limit,
+        channel_key, ctx.current_text_model,
+    )
+    if _rt_history_end_idx < _rt_pre_idx:
+        print(f"✂️ [random_thought] Pre-flight context trim: dropped "
+              f"{_rt_pre_idx - _rt_history_end_idx} history message(s) to fit "
+              f"the {ctx.current_context_limit:,}-token limit")
+
     # Persist the injected instruction as a system-authored user turn BEFORE
     # calling the LLM, so the history log shows the instruction preceding the
     # assistant's spontaneous continuation (correct chronological order).
     save_message(ctx.db, channel_key, "user", instruction, "system")
 
     try:
+        # Use the channel's voice-text model + provider lock when speaking
+        # the follow-up; otherwise fall back to the regular text model
+        # (matching the prior text-only behavior).
+        response_model = ctx.current_voice_model if speak_voice else ctx.current_text_model
+        response_provider_lock = (
+            ctx.current_voice_text_provider_lock if speak_voice
+            else ctx.current_text_provider_lock
+        )
         response_text, _ = await get_ai_response(
-            full_messages, model=ctx.current_text_model, reasoning_effort=ctx.current_reasoning_effort,
+            full_messages, model=response_model,
+            reasoning_effort=ctx.current_reasoning_effort,
             temperature=ctx.current_temperature, top_k=ctx.current_top_k,
             channel_key=channel_key,
-            provider_lock=ctx.current_text_provider_lock,
+            provider_lock=response_provider_lock,
+            debug_enabled=ctx.debug_enabled,
         )
+        if _is_context_overflow_error(response_text):
+            print(f"🚫 [random_thought] Context window exceeded: {response_text[:200]}")
+            recovered, _rt_history_end_idx = attempt_context_recovery(
+                full_messages, _rt_history_end_idx, ctx, response_text,
+                model=response_model,
+            )
+            if recovered:
+                print(f"🔁 [random_thought] Retrying once after context-overflow "
+                      f"self-heal…")
+                response_text, _ = await get_ai_response(
+                    full_messages, model=response_model,
+                    reasoning_effort=ctx.current_reasoning_effort,
+                    temperature=ctx.current_temperature, top_k=ctx.current_top_k,
+                    channel_key=channel_key,
+                    provider_lock=response_provider_lock,
+                    debug_enabled=ctx.debug_enabled,
+                )
+            if _is_context_overflow_error(response_text):
+                print(f"🚫 [random_thought] Context window still exceeded after "
+                      f"self-heal: {response_text[:200]}")
+                return
     except Exception as e:
         print(f"⚠️ random_thought: LLM call failed: {e}")
         _disable_random_thought_counter(ctx.db)
@@ -517,12 +719,17 @@ async def _run_random_thought_prompt(channel_key, companion_name=None):
     async def channel_image_handler(prompt, reference_images=None):
         return await get_image_response(prompt, model=ctx.current_image_model, reference_images=reference_images, provider_lock=ctx.current_image_provider_lock)
 
-    display_text, _, _, _, _, _ = await process_response(
+    async def channel_video_handler(prompt, reference_images=None, reference_videos=None, seconds=None):
+        return await get_video_response(prompt, model=ctx.current_video_model, reference_images=reference_images, reference_videos=reference_videos, seconds=seconds, provider_lock=ctx.current_video_provider_lock)
+
+    display_text, _, _, _, _, _, _, _, had_journal_write = await process_response(
         response_text, target_channel,
-        image_handler=channel_image_handler, db=ctx.db,
+        image_handler=channel_image_handler, video_handler=channel_video_handler, db=ctx.db,
         active_companion=ctx.active_companion,
         send_func=safe_send,
         channel_name=channel_key,
+        anchor_review_ctx=ctx,
+        block_runcmd=True,
     )
 
     if not _is_error_response(response_text):
@@ -531,7 +738,22 @@ async def _run_random_thought_prompt(channel_key, companion_name=None):
         print(f"⚠️ [random_thought] Skipping DB save of error response: {response_text[:120]}")
 
     if display_text:
+        await safe_send(target_channel, "***")
         await safe_send_chunked(target_channel, display_text)
+
+    # Speak the follow-up via TTS when the voice eligibility conditions
+    # above were met. Uses the channel's configured ElevenLabs voice id.
+    if speak_voice and display_text:
+        from .voice_tts_handler import handle_tts
+        await handle_tts(display_text, ctx.current_voice_id, fallback_channel=target_channel)
+
+    if had_journal_write:
+        from .anchor_review import run_anchor_review
+        await run_anchor_review(
+            ctx, target_channel,
+            prior_response_text=response_text,
+            send_func=safe_send,
+        )
 
     # Per spec: do NOT reset to 0 here. Disarm to -1 until the next user-driven
     # LLM response re-arms the counter.
@@ -552,73 +774,496 @@ async def process_live_voice_utterance(wav_bytes, member, channel_name, text_cha
     )
     reset_idle_counters_for_companion(ctx.active_companion, source="live_voice")
 
-    # 1. Transcribe.
-    try:
-        transcript = await speech_to_text(wav_bytes, filename="livevoice.wav")
-    except Exception as e:
-        print(f"⚠️ [livevoice] STT failed: {e}")
-        return
-    transcript = (transcript or "").strip()
-    if not transcript:
-        return
+    # --- helpers shared across the first call and each tool-chain round ---
 
-    print(f"🎙️ [livevoice] {member.display_name}: {transcript}")
-    try:
-        await text_channel.send(f"🎙️ **{member.display_name}**: {transcript}")
-    except Exception:
-        pass
-
-    # 2. Persist user turn.
-    save_message(ctx.db, channel_name, "user", transcript)
-
-    # 4. Build prompt and call the voice model.
-    main_block = build_llm_main_prompt(ctx.db, channel_name, memory_enabled=ctx.effective_memory, anchors_enabled=ctx.effective_anchors, social_mode=ctx.social_mode)
-    history = build_trimmed_history_for_payload(
-        ctx.db, channel_name, main_block, context_limit=ctx.current_context_limit,
-        channel_key=channel_name, model=ctx.current_voice_model
-    )
-    full_messages = compose_full_messages(main_block, history)
-    try:
-        response_text, _ = await get_ai_response(
-            full_messages,
-            model=ctx.current_voice_model,
-            reasoning_effort=ctx.current_reasoning_effort,
-            temperature=ctx.current_temperature,
-            top_k=ctx.current_top_k,
-            channel_key=channel_name,
-            provider_lock=ctx.current_voice_text_provider_lock,
-        )
-    except Exception as e:
-        print(f"⚠️ [livevoice] LLM call failed: {e}")
+    async def _save_interrupted_marker():
+        # Write the "[Your previous response was interrupted...]" system
+        # marker to the DB so the next turn's context reflects the barge-in.
         try:
-            await text_channel.send("*🎙️ (live voice) LLM error — try again.*")
-        except Exception:
-            pass
-        return
+            _now = datetime.now(tz=timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
+            _ts = (f"{_now.strftime('%I:%M %p').lstrip('0')} "
+                   f"{_now.strftime('%A')} {_now.strftime('%B %d, %Y')}")
+            save_message(ctx.db, channel_name, "system",
+                         f"{_ts}: [Your previous response was interrupted during voice "
+                         "playback — the user began speaking before you finished. "
+                         "The user may not have heard the full response.]")
+        except Exception as e:
+            print(f"⚠️ [livevoice] failed to save interrupted marker: {e}")
+
+    async def _save_followup_interrupted_marker():
+        try:
+            _now = datetime.now(tz=timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
+            _ts = (f"{_now.strftime('%I:%M %p').lstrip('0')} "
+                   f"{_now.strftime('%A')} {_now.strftime('%B %d, %Y')}")
+            save_message(ctx.db, channel_name, "system",
+                         f"{_ts}: [You were generating a follow-up response "
+                         "after executing tool calls when the user began speaking "
+                         "again. Your follow-up was not completed. Your prior "
+                         "response was delivered in full; the tool results above "
+                         "remain in context.]")
+        except Exception as e:
+            print(f"⚠️ [livevoice] failed to save followup interrupted marker: {e}")
+
+    async def _speak_and_play(text):
+        # Generate TTS for `text`, post the .mp3 to the text channel, and
+        # play it through the live session's voice client. Returns True if
+        # playback completed without barge-in (or TTS failed harmlessly),
+        # False if the user barged in during playback — signaling the caller
+        # to halt the tool-chain loop.
+        if not text or not session.is_active():
+            return True
+        try:
+            audio_bytes = await text_to_speech(text, voice_id=ctx.current_voice_id)
+            if not audio_bytes:
+                return True
+            try:
+                file = discord.File(io.BytesIO(audio_bytes), filename="response.mp3")
+                await text_channel.send(file=file)
+            except Exception as e:
+                print(f"⚠️ [livevoice] TTS mp3 upload failed: {e}")
+            await session.play_audio_bytes(audio_bytes)
+        except Exception as e:
+            print(f"⚠️ [livevoice] TTS/playback failed: {e}")
+            return True
+        # Check the playback-barge-in flag set by the sink (voice_live.py:473).
+        if getattr(session, "_was_interrupted", False):
+            session._was_interrupted = False
+            await _save_interrupted_marker()
+            return False
+        return True
+
+    # "Typing..." indicator spans STT + LLM inference so it's clear
+    # something is happening. Stops on completion, barge-in cancellation,
+    # or any early return (STT failure, empty transcript, LLM error).
+    async with text_channel.typing():
+        # pycord may hand us a bare discord.Object (with only .id) when
+        # SSRC→user mapping hasn't resolved yet. Try display_name/name first;
+        # if missing, resolve the full Member from the guild by id (cache
+        # first, API fallback) so multi-user sessions get real names too.
+        member_name = (getattr(member, "display_name", None)
+                       or getattr(member, "name", None))
+        if not member_name:
+            _uid = getattr(member, "id", None)
+            if _uid is not None:
+                try:
+                    resolved = await text_channel.guild.get_or_fetch(
+                        discord.Member, _uid, default=None,
+                    )
+                    member_name = getattr(resolved, "display_name", None)
+                except Exception:
+                    pass
+            if not member_name:
+                member_name = f"<user {_uid if _uid is not None else '?'}>"
+        # 1. Transcribe.
+        try:
+            transcript = await speech_to_text(wav_bytes, filename="livevoice.wav")
+        except Exception as e:
+            print(f"⚠️ [livevoice] STT failed: {e}")
+            return
+        transcript = (transcript or "").strip()
+        if not transcript:
+            return
+
+        print(f"🎙️ [livevoice] {member_name}: {transcript}")
+
+        # --- Accumulate-until-activation mode ------------------------------
+        # When LIVEVOICE_SEND_PHRASE is set, every utterance is saved to the
+        # DB as a normal user turn but inference is suppressed until an
+        # utterance contains the phrase (whole-word, case-insensitive). On
+        # trigger, the phrase is stripped from the transcript; if a remainder
+        # is left it's saved as the trigger turn, otherwise inference runs
+        # purely on the accumulated history. When unset, behavior is
+        # unchanged (immediate inference after every utterance).
+        _send_phrase = state.LIVEVOICE_SEND_PHRASE
+        transcript_msg = None
+        if _send_phrase:
+            _phrase_re = re.compile(r"\b" + re.escape(_send_phrase) + r"\b", re.IGNORECASE)
+            if _phrase_re.search(transcript):
+                # Trigger phrase detected — strip it and run inference on
+                # the accumulated history.
+                _stripped = re.sub(r"\s+", " ", _phrase_re.sub("", transcript)).strip()
+                print(f"[livevoice] SEND PHRASE triggered (voice) "
+                      f"stripped='{_stripped}'")
+                # Post the transcript line for what was actually said, plus
+                # divider (inference follows).
+                try:
+                    transcript_msg = await text_channel.send(
+                        f"🎙️ **{member_name}**: {transcript}")
+                    await text_channel.send("━━━━━━━━━━━━━━━━━━")
+                except Exception:
+                    pass
+                if _stripped:
+                    _latest_user_msg_id = save_message(
+                        ctx.db, channel_name, "user", _stripped, member_name,
+                    )
+                    transcript = _stripped
+                else:
+                    # Bare phrase — don't save a trigger turn; let the
+                    # history load pull everything accumulated so far.
+                    _latest_user_msg_id = None
+                    transcript = ""  # skip the turn-append below
+            else:
+                # No trigger phrase — accumulate as a normal user turn, no
+                # inference. Post the transcript line so the user sees it
+                # was captured; skip the divider (no response follows).
+                try:
+                    transcript_msg = await text_channel.send(
+                        f"🎙️ **{member_name}**: {transcript}")
+                except Exception:
+                    pass
+                save_message(ctx.db, channel_name, "user", transcript, member_name)
+                return
+        else:
+            # Normal mode: post transcript + divider, save, proceed to inference.
+            # Capture the transcript Message so it can be passed as user_message
+            # to process_response — this enables <react> directives to add emoji
+            # reactions to the user's transcript line, just like the text path.
+            try:
+                transcript_msg = await text_channel.send(
+                    f"🎙️ **{member_name}**: {transcript}")
+                await text_channel.send("━━━━━━━━━━━━━━━━━━")
+            except Exception:
+                pass
+            # Persist user turn. Pass member_name so the DB row carries the
+            # speaker's display name (parity with the text path at main.py:375),
+            # and capture the row id so the just-saved turn can be excluded from
+            # the history load below and re-appended with a timestamp prefix
+            # (parity with main.py:388-420).
+            _latest_user_msg_id = save_message(
+                ctx.db, channel_name, "user", transcript, member_name,
+            )
+
+        # Consume the pending-turn flag: this utterance inference (and its
+        # tool/follow-up rounds below) runs over full channel history and
+        # therefore subsumes any unprocessed turn(s).
+        state.NEEDS_INFERENCE.pop(channel_name, None)
+
+        # 4. Build prompt and call the voice model.
+        main_block, _ = build_llm_main_prompt(ctx.db, channel_name, memory_enabled=ctx.effective_memory, anchors_enabled=ctx.effective_anchors, social_mode=ctx.social_mode)
+        try:
+            history = build_trimmed_history_for_payload(
+                ctx.db, channel_name, main_block, context_limit=ctx.current_context_limit,
+                channel_key=channel_name, model=ctx.current_voice_model,
+                before_id=_latest_user_msg_id,
+            )
+        except SystemBlockOversizedError as e:
+            print(f"🚫 [livevoice] {e}")
+            try:
+                await safe_send_chunked(text_channel, e.format_user_message())
+            except Exception:
+                pass
+            return
+        full_messages = compose_full_messages(main_block, history)
+        # len(history), NOT len(full_messages): compose prepends the system
+        # block at index 0, so the trimmable-history boundary is the history
+        # length. Using len(full_messages) made the first appended
+        # current-turn message (accumulated images / the spoken transcript)
+        # eligible for FIFO trimming and misplaced the cache breakpoint.
+        history_end_idx = len(history)
+
+        # Inject accumulated images (accumulate-until-activation mode) as a
+        # separate user message BEFORE the trigger turn, so the model sees
+        # them in chronological order. Popped (consumed once) so subsequent
+        # triggers don't re-send the same batch. Handles the case where images
+        # were accumulated via text, then the trigger phrase is spoken via voice.
+        _acc_imgs = state._accumulated_images_by_channel.pop(channel_name, [])
+        if _acc_imgs:
+            _blocks = [{"type": "text", "text":
+                "[The following images were shared earlier in this session, "
+                "in chronological order. They correspond to the [image] tags "
+                "in the conversation history above.]"}]
+            for _uri in _acc_imgs:
+                _blocks.append({"type": "image_url", "image_url": {"url": _uri}})
+            full_messages.append({"role": "user", "content": _blocks})
+
+        # Append the current user turn with a timestamp prefix, mirroring
+        # the text path (main.py:393-420). The DB row holds the clean
+        # "DisplayName: transcript" form (rendered by get_recent_messages);
+        # the in-memory prompt append adds the timestamp the same way the
+        # text path does only for the turn being processed right now.
+        now = datetime.now(tz=timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
+        day_name = now.strftime("%A")
+        time_str = now.strftime("%I:%M %p").lstrip('0')
+        date_str = now.strftime("%B %d, %Y")
+        # In accumulate-trigger mode with a bare send phrase, transcript is
+        # set to "" — skip the turn-append so inference runs purely on the
+        # accumulated DB history (no empty user turn in the payload).
+        if transcript:
+            full_messages.append({
+                "role": "user",
+                "content": f"{time_str} {day_name} {date_str}:{member_name}: {transcript}"
+            })
+
+        # Image handler for <createimage> directives. Uses the channel's
+        # image model — independent of the voice/text model choice.
+        _ref_imgs = state._reference_images_by_channel.get(channel_name)
+        async def channel_image_handler(prompt, reference_images=None):
+            refs = reference_images if reference_images is not None else _ref_imgs
+            return await get_image_response(prompt, model=ctx.current_image_model, reference_images=refs, provider_lock=ctx.current_image_provider_lock)
+
+        _ref_vids = state._reference_videos_by_channel.get(channel_name)
+        async def channel_video_handler(prompt, reference_images=None, reference_videos=None, seconds=None):
+            refs_img = reference_images if reference_images is not None else _ref_imgs
+            refs_vid = reference_videos if reference_videos is not None else _ref_vids
+            return await get_video_response(prompt, model=ctx.current_video_model, reference_images=refs_img, reference_videos=refs_vid, seconds=seconds, provider_lock=ctx.current_video_provider_lock)
+
+        # 5. First inference call (cancellable by barge-in).
+        try:
+            inference_task = asyncio.create_task(get_ai_response(
+                full_messages,
+                model=ctx.current_voice_model,
+                reasoning_effort=ctx.current_reasoning_effort,
+                temperature=ctx.current_temperature,
+                top_k=ctx.current_top_k,
+                channel_key=channel_name,
+                provider_lock=ctx.current_voice_text_provider_lock,
+                debug_enabled=ctx.debug_enabled,
+            ))
+            session._inference_task = inference_task
+            response_text, _ = await inference_task
+        except asyncio.CancelledError:
+            print(f"[livevoice] inference aborted by barge-in")
+            return
+        except Exception as e:
+            print(f"⚠️ [livevoice] LLM call failed: {e}")
+            try:
+                await text_channel.send("*🎙️ (live voice) LLM error — try again.*")
+            except Exception:
+                pass
+            return
+        finally:
+            session._inference_task = None
     if not response_text:
         return
 
-    # 5. Persist assistant turn and post to the text channel.
+    state.LAST_INTERACTION_CHANNEL = channel_name
+    bot_name = (_client.user.display_name
+                if _client is not None and getattr(_client, "user", None) is not None
+                else "Bot")
+
+    # 6. Parse + execute directives from the first response. This is the
+    #    same process_response call the text path uses (llm_loop.py:99),
+    #    enabling all directives (<runcmd>, <readweb>, <readimage>,
+    #    <createimage>, <output>, <react>, <autojournal>, etc.) in live
+    #    voice replies. transcript_msg is passed as user_message so <react>
+    #    can add emoji reactions to the transcript line.
+    prompt_tokens = sum(msg_tokens(m, channel_key=channel_name) for m in full_messages)
+    token_budget = ctx.current_context_limit - prompt_tokens
+
+    display_text, runcmd_results, readweb_results, readimage_results, websearch_results, readskill_results, had_react, _, had_journal_write = await process_response(
+        response_text, text_channel,
+        image_handler=channel_image_handler, video_handler=channel_video_handler, token_budget=token_budget,
+        db=ctx.db, user_message=transcript_msg, consecutive_reacts=0,
+        active_companion=ctx.active_companion, send_func=safe_send,
+        channel_name=channel_name, anchor_review_ctx=ctx,
+    )
+
     if not _is_error_response(response_text):
         save_message(ctx.db, channel_name, "assistant", response_text)
-    else:
-        print(f"⚠️ [livevoice] Skipping DB save of error response: {response_text[:120]}")
-    state.LAST_INTERACTION_CHANNEL = channel_name
 
-    try:
-        await safe_send_chunked(text_channel, response_text)
-    except Exception as e:
-        print(f"⚠️ [livevoice] failed to post text: {e}")
+    # Speak this round's display text immediately (per-round TTS). The
+    # text is also posted to the channel with a 🎙️ prefix, mirroring the
+    # original live-voice reply format. _speak_and_play returns False if
+    # playback was interrupted by barge-in, which halts the tool loop.
+    _playback_ok = True
+    if display_text:
+        try:
+            await safe_send_chunked(text_channel, f"🎙️ **{bot_name}**: {display_text}")
+        except Exception as e:
+            print(f"⚠️ [livevoice] failed to post text: {e}")
+        _playback_ok = await _speak_and_play(display_text)
 
-    # 6. TTS + playback through the live session's voice client.
-    try:
-        audio_bytes = await text_to_speech(response_text, voice_id=ctx.current_voice_id)
-        if audio_bytes:
-            await session.play_audio_bytes(audio_bytes)
-    except Exception as e:
-        print(f"⚠️ [livevoice] TTS/playback failed: {e}")
+    # 7. Tool-chain follow-up loop (ported from llm_loop.py). Each round's
+    #    get_ai_response is cancellable by barge-in (session._inference_task
+    #    is reassigned per round). Tool output is fed back to the model for
+    #    a follow-up, which may itself contain more directives.
+    tool_round = 0
+    while _playback_ok and (runcmd_results or readweb_results or readimage_results or websearch_results or readskill_results) and tool_round < config.MAX_TOOL_ROUNDS:
+        tool_round += 1
 
-    # Random Thoughts: re-arm after a user-driven live-voice response.
+        # Recompute token budget each round — the prompt grows as tool
+        # output is appended, so the budget must shrink accordingly.
+        prompt_tokens = sum(msg_tokens(m, channel_key=channel_name) for m in full_messages)
+        token_budget = ctx.current_context_limit - prompt_tokens
+
+        result_lines = []
+        runcmd_cap = tokens_to_bytes(token_budget, channel_key=channel_name) if config.MAXIMIZE_AVAILABLE_CONTEXT else 16384
+        readweb_cap = tokens_to_bytes(token_budget, channel_key=channel_name) if config.MAXIMIZE_AVAILABLE_CONTEXT else 4000
+        websearch_cap = tokens_to_bytes(token_budget, channel_key=channel_name) if config.MAXIMIZE_AVAILABLE_CONTEXT else 4000
+        for r in runcmd_results:
+            status = "SUCCESS" if r["success"] else "FAILED"
+            output = r["output"] if len(r["output"]) <= runcmd_cap else r["output"][:runcmd_cap] + "... (truncated)"
+            result_lines.append(f"$ {r['command']}\n[{status}]\n{output}")
+        for r in readweb_results:
+            status = "SUCCESS" if r["success"] else "FAILED"
+            output = r["output"] if len(r["output"]) <= readweb_cap else r["output"][:readweb_cap] + "... (truncated)"
+            result_lines.append(f"🌐 {r['url']}\n[{status}]\n{output}")
+        for r in websearch_results:
+            status = "SUCCESS" if r["success"] else "FAILED"
+            output = r["output"] if len(r["output"]) <= websearch_cap else r["output"][:websearch_cap] + "... (truncated)"
+            result_lines.append(f"🔍 {r['query']}\n[{status}]\n{output}")
+        attached_image_urls = []
+        for r in readimage_results:
+            if r["success"]:
+                result_lines.append(f"🖼️ {r['source']}\n[SUCCESS]\n(image attached below)")
+                attached_image_urls.append(r["image_url"])
+            else:
+                result_lines.append(f"🖼️ {r['source']}\n[FAILED]\n{r['error']}")
+        for r in readskill_results:
+            status = "SUCCESS" if r["success"] else "FAILED"
+            result_lines.append(f"📖 {r['path']}\n[{status}]\n{r['output']}")
+        results_summary = "\n\n".join(result_lines)
+        tool_user_text = f"Tool responses:\n\n{results_summary}"
+
+        full_messages.append({"role": "assistant", "content": response_text})
+        if attached_image_urls:
+            async def _to_data_uri(u):
+                # execute_readimage already returns data: URIs for local files;
+                # only HTTP(S) URLs need to be fetched and re-encoded.
+                return u if u.startswith("data:") else await url_to_data_uri(u)
+            image_data_uris = await asyncio.gather(
+                *[_to_data_uri(u) for u in attached_image_urls]
+            )
+            image_data_uris = [d for d in image_data_uris if d]
+            tool_content_blocks = [{"type": "text", "text": tool_user_text}]
+            for data_uri in image_data_uris:
+                tool_content_blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": data_uri},
+                })
+            full_messages.append({"role": "user", "content": tool_content_blocks})
+        else:
+            full_messages.append({"role": "user", "content": tool_user_text})
+
+        save_message(ctx.db, channel_name, "user", tool_user_text, "system")
+
+        history_end_idx = retrim_history_for_tool_round(
+            full_messages, history_end_idx,
+            ctx.current_context_limit, channel_name,
+            ctx.current_voice_model,
+        )
+
+        print(f"🔁 [livevoice] Round {tool_round}/{config.MAX_TOOL_ROUNDS}: "
+              f"sending tool output back to model for follow-up response...")
+        try:
+            inference_task = asyncio.create_task(get_ai_response(
+                full_messages,
+                model=ctx.current_voice_model,
+                reasoning_effort=ctx.current_reasoning_effort,
+                temperature=ctx.current_temperature,
+                top_k=ctx.current_top_k,
+                channel_key=channel_name,
+                provider_lock=ctx.current_voice_text_provider_lock,
+                debug_enabled=ctx.debug_enabled,
+            ))
+            session._inference_task = inference_task
+            response_text, _ = await inference_task
+        except asyncio.CancelledError:
+            print(f"[livevoice] inference aborted by barge-in (round {tool_round})")
+            await _save_followup_interrupted_marker()
+            return
+        except Exception as e:
+            print(f"⚠️ [livevoice] LLM call failed (round {tool_round}): {e}")
+            try:
+                await text_channel.send("*🎙️ (live voice) LLM error — try again.*")
+            except Exception:
+                pass
+            return
+        finally:
+            session._inference_task = None
+
+        if not _is_error_response(response_text):
+            save_message(ctx.db, channel_name, "assistant", response_text)
+
+        followup_display, runcmd_results, readweb_results, readimage_results, websearch_results, readskill_results, _, _, _ = await process_response(
+            response_text, text_channel,
+            image_handler=channel_image_handler, video_handler=channel_video_handler, token_budget=token_budget,
+            db=ctx.db, user_message=transcript_msg,
+            consecutive_reacts=0, suppress_reacts=True,
+            active_companion=ctx.active_companion, send_func=safe_send,
+            channel_name=channel_name,
+        )
+        if followup_display:
+            try:
+                await safe_send_chunked(text_channel, f"🎙️ **{bot_name}**: {followup_display}")
+            except Exception as e:
+                print(f"⚠️ [livevoice] failed to post text: {e}")
+            _playback_ok = await _speak_and_play(followup_display)
+
+    # 8. MAX_TOOL_ROUNDS hit → ask the model for a summary (ported from
+    #    llm_loop.py:205-253). The model is told it hit the limit and asked
+    #    to explain progress to the user; that summary is spoken via TTS.
+    if _playback_ok and tool_round >= config.MAX_TOOL_ROUNDS and (runcmd_results or readweb_results or readimage_results or websearch_results or readskill_results):
+        full_messages.append({"role": "assistant", "content": response_text})
+
+        limit_notice = (
+            f"Alcove Notice: Tool-call limit reached: you've used your "
+            f"{config.MAX_TOOL_ROUNDS} tool rounds for this request, and any tool directives in your last reply were not executed."
+            f"Please explain to your user that you've hit the tool round limit for this request, "
+            f"give them a concise update on what progress you've made so far and what you believe is left to do if they wish to continue (all they have to do is ask)."
+        )
+        full_messages.append({"role": "user", "content": limit_notice})
+        save_message(ctx.db, channel_name, "user", limit_notice, "system")
+
+        history_end_idx = retrim_history_for_tool_round(
+            full_messages, history_end_idx,
+            ctx.current_context_limit, channel_name,
+            ctx.current_voice_model,
+        )
+
+        prompt_tokens = sum(msg_tokens(m, channel_key=channel_name) for m in full_messages)
+        token_budget = ctx.current_context_limit - prompt_tokens
+        try:
+            inference_task = asyncio.create_task(get_ai_response(
+                full_messages, model=ctx.current_voice_model,
+                reasoning_effort=ctx.current_reasoning_effort,
+                temperature=ctx.current_temperature, top_k=ctx.current_top_k,
+                channel_key=channel_name,
+                provider_lock=ctx.current_voice_text_provider_lock,
+                debug_enabled=ctx.debug_enabled,
+            ))
+            session._inference_task = inference_task
+            response_text, _ = await inference_task
+        except asyncio.CancelledError:
+            print(f"[livevoice] summary call aborted by barge-in")
+            await _save_followup_interrupted_marker()
+            return
+        except Exception as e:
+            print(f"⚠️ [livevoice] summary LLM call failed: {e}")
+            return
+        finally:
+            session._inference_task = None
+
+        if not _is_error_response(response_text):
+            save_message(ctx.db, channel_name, "assistant", response_text)
+
+        summary_display, _, _, _, _, _, _, _, _ = await process_response(
+            response_text, text_channel,
+            image_handler=channel_image_handler, video_handler=channel_video_handler, token_budget=token_budget,
+            db=ctx.db, user_message=transcript_msg,
+            consecutive_reacts=0, suppress_reacts=True,
+            active_companion=ctx.active_companion, send_func=safe_send,
+            channel_name=channel_name,
+        )
+        if summary_display:
+            try:
+                await safe_send_chunked(text_channel, f"🎙️ **{bot_name}**: {summary_display}")
+            except Exception as e:
+                print(f"⚠️ [livevoice] failed to post text: {e}")
+            _playback_ok = await _speak_and_play(summary_display)
+
+    # 10. Fire the anchored-memory review AFTER the main response has been
+    #     saved to the DB, so the review turns are appended in correct
+    #     chronological order (parity with main.py:461-467).
+    if had_journal_write:
+        from .anchor_review import run_anchor_review
+        await run_anchor_review(
+            ctx, text_channel,
+            prior_response_text=response_text,
+            send_func=safe_send,
+        )
+
+    # 11. Random Thoughts: re-arm after a user-driven live-voice response.
     if getattr(state, "RANDOM_THOUGHTS_ENABLED", False):
         try:
             _reset_random_thought_counter(ctx.db)
@@ -630,7 +1275,7 @@ async def process_live_voice_utterance(wav_bytes, member, channel_name, text_cha
 # BACKGROUND TASKS
 # ============================================
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=15)
 async def auto_discover_paths_task():
     # Re-scan the companion_datafiles/* auto-discovery directories every 30
     # minutes so newly-added files are picked up without a bot restart.
@@ -638,12 +1283,46 @@ async def auto_discover_paths_task():
         if state.SEARCH_REFERENCES_MODE == 2:
             try:
                 from . import vectors
+                # Skip this tick if the boot vector init is still in flight
+                # or hasn't completed yet. The boot init (main.py
+                # _boot_vector_init thread) handles cold-init with
+                # block_search=True; letting auto_discover's block_search=False
+                # path run concurrently would (a) duplicate the work against an
+                # empty collection and (b) mislabel a cold-init as a routine
+                # non-blocking refresh. Once the boot init completes,
+                # _active_companion_name is set and SEARCH_INITIALIZING clears,
+                # so subsequent 15-min ticks run normally.
+                if getattr(vectors, "_active_companion_name", None) is None or getattr(state, "SEARCH_INITIALIZING", False):
+                    return
                 active_comp = getattr(vectors, "_active_companion_name", None) or "default"
                 paths = get_companion_paths(active_comp)
                 ref_files = _scan_dir_for_files(paths["SEARCH_REFERENCE_DIR"])
-                vectors.init_vector_store(ref_files, chunk_size=state.SEARCH_REFERENCES_CHUNK_SIZE, companion_name=active_comp)
+                # Offload to a thread so this loop task doesn't block the
+                # event loop (and other Discord events) during embeddings.
+                # init_vector_store holds state._vector_init_lock, so this
+                # is safe even if a boot/switchCompanion init is in flight.
+                # block_search=False: this is a routine refresh against an
+                # already-populated collection, so search keeps using the
+                # existing vectors instead of being gated by
+                # SEARCH_INITIALIZING. Cold-init/migration paths still pass
+                # block_search=True (the default).
+                await asyncio.to_thread(
+                    vectors.init_vector_store,
+                    ref_files,
+                    chunk_size=state.SEARCH_REFERENCES_CHUNK_SIZE,
+                    companion_name=active_comp,
+                    block_search=False,
+                )
             except Exception as e:
                 print(f"⚠️ vector store re-sync failed: {e}")
+        # Re-scan skills/ for skill.md files so newly-added/edited skills are
+        # picked up without a restart. warn_on_malformed=False so periodic
+        # refresh doesn't spam the log (boot call already warned once).
+        try:
+            from .main import _load_skills_context
+            _load_skills_context(warn_on_malformed=False)
+        except Exception as e:
+            print(f"⚠️ skills re-sync failed: {e}")
     except Exception as e:
         print(f"⚠️ auto_discover_paths failed: {e}")
         traceback.print_exc()
@@ -659,6 +1338,15 @@ async def prune_orphan_channels_task():
                 live_names.add(build_channel_key(g, ch.name))
             for th in guild.threads:
                 live_names.add(build_channel_key(g, th.name))
+            # Voice and stage channels host text chat too — commands typed
+            # there (e.g. !voicetextmodel) key channel_settings under the
+            # voice-channel name, but guild.text_channels only returns
+            # TextChannel objects, so without this those keys look like
+            # orphans and get their settings pruned.
+            for ch in guild.voice_channels:
+                live_names.add(build_channel_key(g, ch.name))
+            for ch in guild.stage_channels:
+                live_names.add(build_channel_key(g, ch.name))
 
         databases_dir = Path("databases")
         if not databases_dir.is_dir():
@@ -687,16 +1375,19 @@ async def prune_orphan_channels_task():
         total_msg = 0
         total_settings = 0
         total_anchors = 0
+        total_crontab = 0
         for comp in companions:
             comp_db = get_db(comp)
-            msg_removed, settings_removed, anchors_removed = prune_orphan_channels(comp_db, live_names)
+            msg_removed, settings_removed, anchors_removed, crontab_removed = prune_orphan_channels(comp_db, live_names)
             total_msg += msg_removed
             total_settings += settings_removed
             total_anchors += anchors_removed
+            total_crontab += crontab_removed
 
         print(
             f"🧹 prune_orphan_channels: removed {total_msg} messages, "
-            f"{total_settings} channel settings, {total_anchors} anchored memories "
+            f"{total_settings} channel settings, {total_anchors} anchored memories, "
+            f"{total_crontab} scheduled tasks "
             f"across {len(companions)} companion database(s)"
         )
     except Exception as e:
@@ -898,13 +1589,13 @@ async def heartbeat_task():
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
             ip = ""
             try:
-                async with session.get("https://api.ipify.org?format=json") as resp:
+                async with session.get("https://api.ipify.org?format=json", headers=HTTP_PIN) as resp:
                     if resp.status == 200:
                         ip = (await resp.json()).get("ip", "")
             except Exception:
                 pass
             try:
-                await session.post(_HEARTBEAT_URL, json={"ip": ip})
+                await session.post(_HEARTBEAT_URL, json={"ip": ip}, headers=HTTP_PIN)
             except Exception:
                 pass
     except Exception:
@@ -931,3 +1622,28 @@ async def bot_cooldown_tick_task():
                 state._bot_to_bot_counter_by_channel[ch] = v - 1
     except Exception as e:
         print(f"⚠️ bot_cooldown_tick failed: {e}")
+
+
+@tasks.loop(hours=24)
+async def cleanup_old_videos_task():
+    """Delete videos in the output directory older than config.VIDEO_RETENTION_DAYS."""
+    try:
+        from .video_delivery import _resolve_video_dir
+        import time as _time
+        video_dir = _resolve_video_dir()
+        if not video_dir.is_dir():
+            return
+        retention_days = getattr(config, "VIDEO_RETENTION_DAYS", 7)
+        cutoff = _time.time() - (retention_days * 86400)
+        deleted = 0
+        for f in video_dir.iterdir():
+            if f.is_file() and f.suffix == ".mp4" and f.stat().st_mtime < cutoff:
+                try:
+                    f.unlink()
+                    deleted += 1
+                except Exception as e:
+                    print(f"⚠️ Could not delete {f}: {e}")
+        if deleted:
+            print(f"🧹 Cleaned up {deleted} video(s) older than {retention_days} days from {video_dir}")
+    except Exception as e:
+        print(f"⚠️ cleanup_old_videos_task failed: {e}")

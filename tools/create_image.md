@@ -24,3 +24,6 @@ add a pixie to the scene, matching the style and lighting of the reference photo
 - The user wants a brand new image from scratch, even if they previously shared a photo
 - The user says "never mind" or changes direction away from the reference image
 - The reference image was shared for context only (e.g. "what does this look like?" → describe it, don't generate from it, unless they ask you to generate an image based on it)
+
+**Notes:**
+- Not all image models support reference images, and limits vary by model. If the model doesn't support references, you'll get an error — try a different model or omit the reference.

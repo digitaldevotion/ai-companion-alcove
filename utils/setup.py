@@ -16,13 +16,28 @@ except ImportError:
     readline = None
 
 
-# ── Auto-activate ~/alcove-env (macOS / Linux only) ─────────────────
-if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.base_prefix:
+# ── Auto-activate ~/alcove-env (macOS / Linux / Windows) ────────────
+if not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.base_prefix:
     _venv_dir = os.path.expanduser("~/alcove-env")
-    _venv_python = os.path.join(_venv_dir, "bin", "python3")
-    if os.path.isdir(_venv_dir) and os.path.isfile(_venv_python):
+    if os.name == "nt":
+        _venv_bin = os.path.join(_venv_dir, "Scripts")
+        _venv_python = os.path.join(_venv_bin, "python.exe")
+    else:
+        _venv_bin = os.path.join(_venv_dir, "bin")
+        _venv_python = os.path.join(_venv_bin, "python3")
+    if os.path.isfile(_venv_python):
         os.environ["VIRTUAL_ENV"] = _venv_dir
-        os.environ["PATH"] = os.path.join(_venv_dir, "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
+        if os.name == "nt":
+            # Windows os.execv is not a true exec (it spawns a new process
+            # and mangles arguments containing spaces), so launch a
+            # subprocess instead and forward its exit code.
+            import subprocess
+            try:
+                completed = subprocess.run([_venv_python] + sys.argv)
+            except KeyboardInterrupt:
+                sys.exit(130)
+            sys.exit(completed.returncode)
         os.execv(_venv_python, [_venv_python] + sys.argv)
 
 
@@ -74,7 +89,8 @@ def clear_screen():
 
 
 def ask_question(prompt_text):
-    val = input(prompt_text).strip()
+    print(prompt_text)
+    val = input("> ").strip()
     print()  # Extra return between questions
     return val
 
@@ -113,6 +129,8 @@ def _run_setup():
     _tmpl_text_model = _tmpl_text_model_match.group(1) if _tmpl_text_model_match else "z-ai/glm-5.1"
     _tmpl_image_model_match = re.search(r'CURRENT_IMAGE_MODEL\s*=\s*"([^"]*)"', template_content)
     _tmpl_image_model = _tmpl_image_model_match.group(1) if _tmpl_image_model_match else "google/gemini-3.1-flash-image-preview"
+    _tmpl_video_model_match = re.search(r'CURRENT_VIDEO_MODEL\s*=\s*"([^"]*)"', template_content)
+    _tmpl_video_model = _tmpl_video_model_match.group(1) if _tmpl_video_model_match else "google/veo-3.1-lite"
 
     while True:
         clear_screen()
@@ -178,6 +196,10 @@ def _run_setup():
             default_image_model = _tmpl_image_model
         else:
             default_image_model = "nano-banana-2"
+        if provider == "openrouter":
+            default_video_model = _tmpl_video_model
+        else:
+            default_video_model = "minimax-h3"
 
         print(s(C.BCYN + C.BLD, "--- Text Model Selection ---"))
         print("To browse available text models, visit:")
@@ -204,12 +226,29 @@ def _run_setup():
             default_image_model
         )
 
+        print(s(C.BCYN + C.BLD, "--- Video Model Selection ---"))
+        print("To browse available video models, visit:")
+        print(f"  NanoGPT    - {s(C.UND, 'https://nano-gpt.com/models/video')}")
+        print(f"  OpenRouter - {s(C.UND, 'https://openrouter.ai/models?output_modalities=video')}")
+        print()
+        print(f"The starting default {s(C.BGRN, default_video_model)}")
+        print(f"for the video model on {provider.capitalize()}.")
+        print()
+        current_video_model = ask_question_with_default(
+            "Enter the default video model you wish to use or press ENTER to accept the default: ",
+            default_video_model
+        )
+
         # 4. ElevenLabs API key
         elevenlabs_api_key = ask_question("Enter your ElevenLabs API key if you wish to use voice mode\n(or press Enter to skip): ")
 
         elevenlabs_voice_id = ""
         current_voice_text_model = current_text_model
+        live_voice_send_phrase = ""
         if elevenlabs_api_key:
+            print(s(C.BYEL, "ℹ️  Voice mode requires ffmpeg to be installed and on your PATH."))
+            print(s(C.BYEL, "    See the Alcove OS installation manual: https://ai-alcove.neocities.org/"))
+            print()
             while True:
                 elevenlabs_voice_id = ask_question("Enter the default voice ID you want to use with ElevenLabs (required): ")
                 if elevenlabs_voice_id:
@@ -227,6 +266,36 @@ def _run_setup():
                 current_text_model
             )
 
+            # Live Voice Send Phrase
+            print(s(C.BCYN + C.BLD, "--- Live Voice Send Phrase (optional) ---"))
+            print("When set, messages you speak in the active live-voice channel are saved to")
+            print("your conversation history WITHOUT your companion replying, until a message")
+            print("contains this phrase. The phrase is then stripped, and your companion")
+            print("replies once over everything said so far. This lets you speak multiple")
+            print("messages in a row, then trigger a single reply.")
+            print()
+            print(s(C.BYEL, "Tip: pick a distinctive, multi-word phrase that is easy for voice"))
+            print(s(C.BYEL, "recognition to catch (e.g. \"please send\", \"over to you\"). Avoid"))
+            print(s(C.BYEL, "common words or short phrases that might be uttered accidentally,"))
+            print(s(C.BYEL, "and avoid phrases that are difficult for speech-to-text to parse."))
+            print()
+
+            while True:
+                live_voice_send_phrase = ask_question(
+                    "Enter a Live Voice send phrase if you wish to use one\n"
+                    "(or press Enter to skip \u2014 your companion will reply as soon as you stop talking): "
+                )
+                if not live_voice_send_phrase:
+                    live_voice_send_phrase = ""
+                    break
+                if not re.search(r"\s", live_voice_send_phrase):
+                    print(s(C.BRED, "Error: phrase must be multiple words (single-word phrases are"))
+                    print(s(C.BRED, "       hard to recognize reliably and prone to false triggers)."))
+                    print()
+                    continue
+                print(s(C.BGRN, f"Live Voice send phrase set: \"{live_voice_send_phrase}\""))
+                break
+
         # Summary screen
         clear_screen()
         print(s(C.BCYN + C.BLD, "=========================================="))
@@ -240,10 +309,15 @@ def _run_setup():
         print(f"{'Default Provider':<20}: {provider}")
         print(f"{'Text Model':<20}: {current_text_model}")
         print(f"{'Image Model':<20}: {current_image_model}")
+        print(f"{'Video Model':<20}: {current_video_model}")
         print(f"{'ElevenLabs API Key':<20}: {elevenlabs_api_key if elevenlabs_api_key else '(empty)'}")
         if elevenlabs_api_key:
             print(f"{'ElevenLabs Voice ID':<20}: {elevenlabs_voice_id if elevenlabs_voice_id else '(empty)'}")
             print(f"{'Voice Text Model':<20}: {current_voice_text_model}")
+            if live_voice_send_phrase:
+                print(f"{'Live Voice Phrase':<20}: {live_voice_send_phrase}")
+            else:
+                print(f"{'Live Voice Phrase':<20}: (not set)")
         print()
 
         confirm = input("Is everything correct? (y/n)? ").strip().lower()
@@ -304,6 +378,10 @@ def _run_setup():
         # Replace ELEVENLABS_VOICE_ID
         content = content.replace("REPLACE_WITH_ELEVENLABS_VOICE_ID", elevenlabs_voice_id)
 
+        # Replace LIVE_VOICE_SEND_PHRASE
+        content = content.replace('LIVE_VOICE_SEND_PHRASE = ""',
+                                  f'LIVE_VOICE_SEND_PHRASE = "{live_voice_send_phrase}"')
+
         # Replace CURRENT_TEXT_MODEL
         content = re.sub(
             r'(CURRENT_TEXT_MODEL\s*=\s*")[^"]*(")',
@@ -315,6 +393,13 @@ def _run_setup():
         content = re.sub(
             r'(CURRENT_IMAGE_MODEL\s*=\s*")[^"]*(")',
             rf'\g<1>{current_image_model}\g<2>',
+            content
+        )
+
+        # Replace CURRENT_VIDEO_MODEL
+        content = re.sub(
+            r'(CURRENT_VIDEO_MODEL\s*=\s*")[^"]*(")',
+            rf'\g<1>{current_video_model}\g<2>',
             content
         )
 
@@ -342,6 +427,13 @@ def _run_setup():
         print(s(C.BGRN + C.BLD, "=========================================="))
         print(f"File created at: {config_path}")
         print()
+
+        if elevenlabs_api_key and not shutil.which("ffmpeg"):
+            print(s(C.BYEL + C.BLD, "⚠️ Warning: ElevenLabs voice is configured but ffmpeg was not found on PATH."))
+            print(s(C.BYEL, "    Voice mode will not work until ffmpeg is installed."))
+            print(s(C.BYEL, "    See the Alcove OS installation manual: https://ai-alcove.neocities.org/"))
+            print()
+
         return 0
 
     except Exception as e:

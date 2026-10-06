@@ -9,13 +9,28 @@ import re
 import sys
 from pathlib import Path
 
-# ── Auto-activate ~/alcove-env (macOS / Linux only) ─────────────────
-if os.name != "nt" and not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.base_prefix:
+# ── Auto-activate ~/alcove-env (macOS / Linux / Windows) ────────────
+if not os.environ.get("VIRTUAL_ENV") and sys.prefix == sys.base_prefix:
     _venv_dir = os.path.expanduser("~/alcove-env")
-    _venv_python = os.path.join(_venv_dir, "bin", "python3")
-    if os.path.isdir(_venv_dir) and os.path.isfile(_venv_python):
+    if os.name == "nt":
+        _venv_bin = os.path.join(_venv_dir, "Scripts")
+        _venv_python = os.path.join(_venv_bin, "python.exe")
+    else:
+        _venv_bin = os.path.join(_venv_dir, "bin")
+        _venv_python = os.path.join(_venv_bin, "python3")
+    if os.path.isfile(_venv_python):
         os.environ["VIRTUAL_ENV"] = _venv_dir
-        os.environ["PATH"] = os.path.join(_venv_dir, "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
+        if os.name == "nt":
+            # Windows os.execv is not a true exec (it spawns a new process
+            # and mangles arguments containing spaces), so launch a
+            # subprocess instead and forward its exit code.
+            import subprocess
+            try:
+                completed = subprocess.run([_venv_python] + sys.argv)
+            except KeyboardInterrupt:
+                sys.exit(130)
+            sys.exit(completed.returncode)
         os.execv(_venv_python, [_venv_python] + sys.argv)
 
 

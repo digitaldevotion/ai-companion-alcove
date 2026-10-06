@@ -17,9 +17,11 @@ TARGETS = [
     ("config.py",              False, False),
     ("companion_datafiles",    True,  True),
     ("databases",              True,  True),
+    ("diag",                   True,  True),
+    ("input",                  True,  True),
+    ("output",                 True,  True),
     (".claude",                True,  False),
     ("CLAUDE.md",              False, False),
-    (".DS_Store",              False, False),
     ("*.pid",                  False, False)
 ]
 
@@ -74,7 +76,13 @@ def main():
     print("  - Companion databases (contents of databases/)")
     print("  - Configuration       (config.py)")
     print("  - Companion datafiles (contents of companion_datafiles/)")
+    print("  - Diagnostics logs    (contents of diag/)")
+    print("  - Input directory     (contents of input/)")
+    print("  - Output directory    (contents of output/)")
+    print("  - Test skill directories (skills/test-*)")
     print("  - __pycache__ directories (everywhere in the tree)")
+    print("  - __init__.py files    (everywhere in the tree)")
+    print("  - .DS_Store files      (everywhere in the tree)")
     print("  - Documentation, caches, and other generated files")
     print()
     print("This action CANNOT be undone.")
@@ -106,6 +114,7 @@ def main():
                     print(f"  Skipping  {name}/  (already empty)")
                     continue
                 is_datafiles = (name == "companion_datafiles")
+                is_input = (name == "input")
                 if is_datafiles:
                     for entry in entries:
                         entry_path = os.path.join(path, entry)
@@ -128,6 +137,18 @@ def main():
                         elif os.path.isdir(entry_path):
                             shutil.rmtree(entry_path)
                             print(f"  Removed   {name}/{entry}/")
+                        else:
+                            os.remove(entry_path)
+                            print(f"  Removed   {name}/{entry}")
+                elif is_input:
+                    # Keep all subdirectories inside input/ (emptied), remove
+                    # loose files. This preserves the folder layout while
+                    # wiping generated/user content.
+                    for entry in entries:
+                        entry_path = os.path.join(path, entry)
+                        if os.path.isdir(entry_path):
+                            _empty_directory(entry_path)
+                            print(f"  Cleared   {name}/{entry}/*  (kept folder)")
                         else:
                             os.remove(entry_path)
                             print(f"  Removed   {name}/{entry}")
@@ -162,7 +183,25 @@ def main():
             else:
                 print(f"  Skipping  {name}  (not found)")
 
-    for dirpath, dirnames, _ in os.walk(root_dir, topdown=True):
+    # skills/ — remove disposable "test-*" skill directories (e.g.
+    # test-spelunking). Real skills are left untouched.
+    skills_dir = os.path.join(root_dir, "skills")
+    if os.path.isdir(skills_dir):
+        removed_any = False
+        for entry in sorted(os.listdir(skills_dir)):
+            if not entry.startswith("test-"):
+                continue
+            entry_path = os.path.join(skills_dir, entry)
+            if os.path.isdir(entry_path):
+                shutil.rmtree(entry_path)
+                print(f"  Removed   skills/{entry}/")
+                removed_any = True
+        if not removed_any:
+            print(f"  Skipping  skills/test-*/  (none found)")
+    else:
+        print(f"  Skipping  skills/test-*/  (no skills/ dir)")
+
+    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True):
         for dirname in dirnames:
             if dirname == "__pycache__":
                 pycache_path = os.path.join(dirpath, dirname)
@@ -170,6 +209,12 @@ def main():
                 rel = os.path.relpath(pycache_path, root_dir)
                 print(f"  Removed   {rel}/")
         dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for filename in filenames:
+            if filename in ("__init__.py", ".DS_Store"):
+                file_path = os.path.join(dirpath, filename)
+                os.remove(file_path)
+                rel = os.path.relpath(file_path, root_dir)
+                print(f"  Removed   {rel}")
 
     print()
     print("Cleanup complete.")

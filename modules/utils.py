@@ -9,8 +9,80 @@ import asyncio
 import base64
 from datetime import datetime
 import discord
+import importlib
 import io
 import re
+
+
+# ── HTTP content-encoding pin ─────────────────────────────────────────────
+# aiohttp advertises "br"/"zstd" in Accept-Encoding whenever brotli/zstd
+# modules are IMPORTABLE in the interpreter — but an importable-yet-broken
+# install (e.g. conda base's old brotlipy shadowing Google's Brotli, or a
+# clobbered C extension) then fails on real payloads with
+# "Can not decode content-encoding: br", breaking provider connectivity
+# for metadata endpoints (credits, model lists, auto-context lookups).
+# Pinning Accept-Encoding to codecs aiohttp can ALWAYS decode natively
+# (zlib is compiled into CPython itself) makes Alcove's HTTP behavior
+# identical in every environment, regardless of what optional packages
+# other software has left in site-packages.
+HTTP_PIN = {"Accept-Encoding": "gzip, deflate"}
+
+
+def _probe_compression_module(names):
+    """Classify an optional HTTP-compression backend.
+
+    Returns (state, module_name) where state is:
+      "ok"     — importable and passes a compress→decompress round-trip
+      "broken" — importable but the round-trip fails (the state that makes
+                 aiohttp negotiate encodings it cannot actually decode)
+      "absent" — not importable (aiohttp never advertises it; harmless)
+    """
+    for name in names:
+        try:
+            mod = importlib.import_module(name)
+        except Exception:
+            continue
+        try:
+            sample = b"alcove-compression-probe" * 4
+            compress = getattr(mod, "compress", None)
+            decompress = getattr(mod, "decompress", None)
+            if callable(compress) and callable(decompress):
+                ok = decompress(compress(sample)) == sample
+                return ("ok" if ok else "broken"), name
+            if hasattr(mod, "ZstdCompressor") and hasattr(mod, "ZstdDecompressor"):
+                # zstandard/stdlib-style API (no module-level compress/decompress)
+                obj = mod.ZstdDecompressor().decompressobj()
+                out = obj.decompress(mod.ZstdCompressor().compress(sample))
+                ok = (out + obj.flush()) == sample
+                return ("ok" if ok else "broken"), name
+            # Importable but no recognizable round-trip API — report presence
+            # without claiming it is broken (avoids false warnings).
+            return "present", name
+        except Exception:
+            return "broken", name
+    return "absent", None
+
+
+def compression_env_state():
+    """Fingerprint of the runtime's HTTP compression environment for !diag.
+
+    Never raises — every probe is exception-guarded so diagnostics cannot
+    themselves take the bot down on a machine with exotic breakage.
+    """
+    brotli_state, brotli_name = _probe_compression_module(("brotli", "brotlicffi"))
+    zstd_state, zstd_name = _probe_compression_module(
+        ("compression.zstd", "backports.zstd", "zstandard")
+    )
+    try:
+        import aiohttp
+        aiohttp_ver = aiohttp.__version__
+    except Exception:
+        aiohttp_ver = "?"
+    return {
+        "brotli": brotli_state, "brotli_module": brotli_name,
+        "zstd": zstd_state, "zstd_module": zstd_name,
+        "aiohttp": aiohttp_ver,
+    }
 
 
 # Matches a leading Discord mention of a specific user id: <@123> or <@!123>.
@@ -39,11 +111,18 @@ BYTES_PER_TOKEN = 4
 _channel_calibration = {}
 
 
-def update_token_calibration(channel_key, prompt_bytes, actual_tokens):
+def update_token_calibration(channel_key, prompt_bytes, actual_tokens, force=False):
+    """Blend a bytes-per-token observation into the channel's running average.
+
+    force=True REPLACES the average instead of blending (n reset to 1) —
+    used by context-overflow self-heal, where the provider has just
+    reported the exact token count for the failing payload and the
+    running average may be polluted by prior bad samples.
+    """
     if not channel_key or actual_tokens <= 0:
         return
     observed = prompt_bytes / actual_tokens
-    if channel_key not in _channel_calibration:
+    if force or channel_key not in _channel_calibration:
         _channel_calibration[channel_key] = (observed, 1)
     else:
         avg, n = _channel_calibration[channel_key]
@@ -77,7 +156,44 @@ def msg_tokens(msg, channel_key=None):
     if isinstance(c, str):
         return estimate_tokens(c, channel_key=channel_key)
     if isinstance(c, list):
-        return sum(estimate_tokens(b.get("text", ""), channel_key=channel_key) for b in c if isinstance(b, dict))
+        total = 0
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                total += estimate_tokens(b.get("text", ""), channel_key=channel_key)
+            elif btype == "image_url":
+                url = b.get("image_url", {}).get("url", "")
+                payload = url.split(",", 1)[1] if "," in url else url
+                total += max(85, len(payload) // 1333)
+            elif btype == "input_audio":
+                data = b.get("input_audio", {}).get("data", "")
+                total += max(100, len(data) // 1333)
+        return total
+    return 0
+
+
+def msg_content_bytes(msg):
+    """Content-only UTF-8 byte length of a message — the exact basis
+    estimate_tokens/msg_tokens measure. Used for token-ratio calibration
+    (see provider.chat_completion) so the calibrated bytes-per-token ratio
+    is derived from the same byte counts the estimator uses, instead of
+    JSON-serialized bytes (role labels, quotes, escaping) the estimator
+    never sees. Text blocks only; multimodal payloads are excluded
+    (calibration is gated to pure-text prompts anyway).
+    """
+    c = msg.get("content", "")
+    if c is None:
+        return 0
+    if isinstance(c, str):
+        return len(c.encode("utf-8"))
+    if isinstance(c, list):
+        total = 0
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text":
+                total += len(b.get("text", "").encode("utf-8"))
+        return total
     return 0
 
 

@@ -9,3 +9,7 @@ SEARCH_REFERENCES_ENABLED
 
 # Auto-discovered from tools/ directory — force empty list on upgrade
 LOADED_TOOL_LOCATIONS
+
+# Recalibrated for bge-m3 (1024-dim) — old 0.65 value tuned for MiniLM
+# (384-dim) let everything through bge-m3's tighter distance band.
+SEARCH_REFERENCES_DISTANCE_THRESHOLD

@@ -5,7 +5,7 @@
 # This software is distributed as FREEWARE. Please refer to the readme.txt file for more information.
 # ============================================
 
-from .prompt import _is_error_response
+from .llm_prompt_builder import _is_error_response
 from .database import save_message
 
 
@@ -24,15 +24,29 @@ def save_history(pending_saves, response_text, db, channel_name):
             print(f"⚠️ save_history: save_message failed (item kept for flush): {_save_err}")
             _i += 1
     if not _is_error_response(response_text):
-        save_message(db, channel_name, "assistant", response_text)
+        try:
+            save_message(db, channel_name, "assistant", response_text)
+        except Exception as _final_err:
+            # The reply was fully generated — a transient DB failure here must
+            # not lose it. Callers post the response after save_history
+            # returns, so swallowing (with a loud log) keeps the user's answer
+            # visible even though this turn won't be persisted.
+            print(f"⚠️ save_history: FINAL assistant save failed: {_final_err}")
     else:
         print(f"⚠️ Skipping DB save of final error response: {response_text[:120]}")
 
 
 def flush_pending_saves(pending_saves, db, channel_name):
     while pending_saves:
-        try:
-            _role, _body, _name = pending_saves.pop(0)
-            save_message(db, channel_name, _role, _body, _name)
-        except Exception as _flush_err:
-            print(f"⚠️ pending_saves flush error: {_flush_err}")
+        _role, _body, _name = pending_saves[0]
+        _saved = False
+        for _attempt in range(3):
+            try:
+                save_message(db, channel_name, _role, _body, _name)
+                _saved = True
+                break
+            except Exception as _flush_err:
+                print(f"⚠️ pending_saves flush error (attempt {_attempt + 1}/3): {_flush_err}")
+        if not _saved:
+            print(f"❌ pending_saves: DROPPING unsavable turn ({_role}) after 3 attempts: {_body[:120]}")
+        pending_saves.pop(0)

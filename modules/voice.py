@@ -7,7 +7,10 @@
 import aiohttp
 import asyncio
 import discord
+import time
 from config import ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_VOICE_MODEL
+from . import state
+from .utils import HTTP_PIN
 from .voice_utils import mp3_to_pcm, play_pcm_on_voice_client
 
 _ELEVENLABS_TIMEOUT = aiohttp.ClientTimeout(total=120)
@@ -18,7 +21,7 @@ async def get_elevenlabs_subscription():
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.get(
                 "https://api.elevenlabs.io/v1/user/subscription",
-                headers={"xi-api-key": ELEVENLABS_API_KEY},
+                headers={"xi-api-key": ELEVENLABS_API_KEY, **HTTP_PIN},
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -57,6 +60,7 @@ async def text_to_speech(text, voice_id=None):
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
+        **HTTP_PIN,
     }
     payload = {
         "text": text,
@@ -88,6 +92,7 @@ async def speech_to_text(audio_bytes, filename="audio.ogg"):
     url = "https://api.elevenlabs.io/v1/speech-to-text"
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
+        **HTTP_PIN,
     }
 
     # Derive content-type from the filename extension so callers can pass
@@ -123,21 +128,33 @@ class VoiceManager:
 
     def __init__(self):
         self.voice_client = None
+        # Inactivity timeout (push-to-talk mode). Mirrors LiveVoiceSession's
+        # _idle_watchdog: after LIVEVOICE_INACTIVITY_TIMEOUT_MIN minutes with
+        # no successful TTS playback, auto-disconnect. Activity is tracked as
+        # the timestamp of the last voice reply (play_audio() success).
+        self.text_channel = None
+        self._inactivity_task = None
+        self._last_voice_reply_ts = 0.0
 
-    async def join(self, channel):
+    async def join(self, channel, text_channel=None):
+        # `text_channel` is the Discord text channel the !join command was
+        # issued from; used to post the inactivity-disconnect notice. May be
+        # None (programmatic joins) — in that case the watchdog still runs
+        # but disconnects silently.
         try:
             guild_vc = channel.guild.voice_client
 
             if guild_vc and guild_vc.is_connected():
                 self.voice_client = guild_vc
                 if self.voice_client.channel == channel:
-                    return True
-                try:
-                    await self.voice_client.move_to(channel)
-                except Exception:
-                    await guild_vc.disconnect(force=True)
-                    self.voice_client = None
-                    self.voice_client = await channel.connect()
+                    pass
+                else:
+                    try:
+                        await self.voice_client.move_to(channel)
+                    except Exception:
+                        await guild_vc.disconnect(force=True)
+                        self.voice_client = None
+                        self.voice_client = await channel.connect()
 
             elif guild_vc and not guild_vc.is_connected():
                 await guild_vc.disconnect(force=True)
@@ -146,8 +163,9 @@ class VoiceManager:
 
             elif self.voice_client and self.voice_client.is_connected():
                 if self.voice_client.channel == channel:
-                    return True
-                await self.voice_client.move_to(channel)
+                    pass
+                else:
+                    await self.voice_client.move_to(channel)
 
             else:
                 self.voice_client = await channel.connect()
@@ -170,11 +188,23 @@ class VoiceManager:
             traceback.print_exc()
             return False
         print(f"🔊 Joined voice channel: {channel.name}")
+
+        # (Re)start the inactivity watchdog for this connection. A successful
+        # join counts as activity, so the clock starts fresh here. Re-joins /
+        # moves also reset the clock so a stale task from a prior session
+        # doesn't fire prematurely.
+        self.text_channel = text_channel
+        self._last_voice_reply_ts = time.time()
+        await self._restart_inactivity_watchdog()
         return True
 
     async def leave(self, guild=None):
         guild_vc = guild.voice_client if guild else None
         vc = self.voice_client if (self.voice_client and self.voice_client.is_connected()) else guild_vc
+        # Cancel the inactivity watchdog regardless of whether a vc is found,
+        # so a stale task from a torn-down connection doesn't linger.
+        await self._cancel_inactivity_watchdog()
+        self.text_channel = None
         if vc:
             channel_name = getattr(vc.channel, 'name', 'unknown')
             try:
@@ -204,7 +234,63 @@ class VoiceManager:
         if wav_bytes is None:
             return False
 
-        return await play_pcm_on_voice_client(self.voice_client, wav_bytes)
+        ok = await play_pcm_on_voice_client(self.voice_client, wav_bytes)
+        # A successful playback counts as a voice reply — reset the
+        # inactivity clock so the watchdog doesn't fire right after the
+        # bot spoke. Mirrors LiveVoiceSession._last_interaction_ts.
+        if ok:
+            self._last_voice_reply_ts = time.time()
+        return ok
+
+    async def _restart_inactivity_watchdog(self):
+        await self._cancel_inactivity_watchdog()
+        self._inactivity_task = asyncio.create_task(self._inactivity_watchdog())
+
+    async def _cancel_inactivity_watchdog(self):
+        task = self._inactivity_task
+        self._inactivity_task = None
+        if task is None:
+            return
+        try:
+            task.cancel()
+        except Exception:
+            pass
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _inactivity_watchdog(self):
+        # Auto-disconnect after LIVEVOICE_INACTIVITY_TIMEOUT_MIN of no voice
+        # replies (i.e. no successful play_audio() calls). Mirrors
+        # LiveVoiceSession._idle_watchdog (voice_live.py:252). Runs on the
+        # event loop, so reading/writing _last_voice_reply_ts is safe.
+        try:
+            timeout_sec = getattr(state, "LIVEVOICE_INACTIVITY_TIMEOUT_MIN", 30) * 60
+            while self.is_connected():
+                await asyncio.sleep(15)
+                idle_sec = time.time() - self._last_voice_reply_ts
+                if idle_sec > timeout_sec:
+                    print(f"⏰ [voice] inactive for {idle_sec:.0f}s — auto-disconnect")
+                    if self.text_channel is not None:
+                        try:
+                            await self.text_channel.send(
+                                f"*🎙️ Voice inactive for "
+                                f"{getattr(state, 'LIVEVOICE_INACTIVITY_TIMEOUT_MIN', 30)} "
+                                f"min — disconnected.*"
+                            )
+                        except Exception:
+                            pass
+                    # Null our own task reference BEFORE calling leave(), so
+                    # leave()._cancel_inactivity_watchdog() sees None and
+                    # returns immediately instead of trying to cancel/await
+                    # the very task we're currently running in (which would
+                    # deadlock).
+                    self._inactivity_task = None
+                    await self.leave()
+                    return
+        except asyncio.CancelledError:
+            return
 
 # Singleton instance
 voice_manager = VoiceManager()

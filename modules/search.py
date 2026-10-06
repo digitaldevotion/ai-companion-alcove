@@ -5,28 +5,30 @@
 # This software is distributed as FREEWARE. Please refer to the readme.txt file for more information.
 # ============================================
 
+import asyncio
 import os
 import re
 import traceback
 
 from . import provider
+from . import state
 import config
 from .companions import load_file_content, get_companion_resolved_locations
 from .database import get_channel_companion
 from .utils import estimate_tokens, msg_tokens, tokens_to_bytes
 
-INTERNAL_LOGIC_MODEL = (
-    "anthropic/claude-haiku-4.5"
+LIGHTWEIGHT_LOGIC_MODEL = (
+    "~anthropic/claude-haiku-latest"
     if provider.get_provider() == "openrouter"
     else "anthropic/claude-haiku-latest"
 )
 
 
-async def internal_model_query(query):
-    # Lightweight query to the internal logic model — no system prompt, no memory, no history.
+async def lightweight_model_query(query):
+    # Minimal query to the lightweight logic model — no system prompt, no memory, no history.
     # Returns the model's response as a string.
     return await provider.chat_completion_text(
-        INTERNAL_LOGIC_MODEL,
+        LIGHTWEIGHT_LOGIC_MODEL,
         [{"role": "user", "content": query}],
     )
 
@@ -46,7 +48,7 @@ async def extract_search_keywords(prompt):
         + prompt
     )
     try:
-        result = await internal_model_query(query)
+        result = await lightweight_model_query(query)
         print(f"🔑 extract_search_keywords input: {prompt[:80]}")
         print(f"🔑 extract_search_keywords result: {result}")
 
@@ -103,7 +105,7 @@ async def expand_search_terms(prompt):
         + prompt
     )
     try:
-        result = await internal_model_query(query)
+        result = await lightweight_model_query(query)
         print("--------------------------------")
         print(f"🔍 expand_search_terms input: {prompt}")
         print(f"🔍 expand_search_terms result: {result}")
@@ -264,12 +266,16 @@ def semantic_search(search_terms_result, reference_locations, max_buffer=10000):
 # Search context injection
 # ============================================
 
-def _calculate_search_budget(full_messages, context_limit):
-    used_tokens = sum(msg_tokens(m) for m in full_messages)
+def _calculate_search_budget(full_messages, context_limit, channel_key=None):
+    # channel_key matters: without it msg_tokens/tokens_to_bytes fall back
+    # to the 4-bytes-per-token default instead of the channel's calibrated
+    # ratio, undercounting used tokens on token-dense conversations and
+    # letting search results over-inject past the context budget.
+    used_tokens = sum(msg_tokens(m, channel_key=channel_key) for m in full_messages)
     remaining_tokens = context_limit - used_tokens
     _reserve = max(10000, int(remaining_tokens * 0.07))
     search_token_budget = max(0, remaining_tokens - _reserve)
-    budget_max_chars = tokens_to_bytes(search_token_budget)
+    budget_max_chars = tokens_to_bytes(search_token_budget, channel_key=channel_key)
     if config.SEARCH_REFERENCES_MAX_RETURN_BYTES > 0:
         budget_max_chars = min(budget_max_chars, config.SEARCH_REFERENCES_MAX_RETURN_BYTES)
     return search_token_budget, budget_max_chars, used_tokens
@@ -300,9 +306,27 @@ async def inject_search_context(full_messages, combined_content, ctx, search_ref
 
     if search_references_mode == 2:
         from . import vectors
+        # Skip the search step entirely while a (re)build is in progress so
+        # the bot stays responsive to prompts during potentially long
+        # embeddings. The flag is set/cleared by vectors.init_vector_store
+        # under state._vector_init_lock.
+        if state.SEARCH_INITIALIZING:
+            print(f"🔎 vector_search skipped — vector store initializing")
+            return full_messages
+
+        # If the active companion's vector store isn't loaded yet, kick off
+        # a background init (fire-and-forget) and skip search for this
+        # message. Subsequent messages skip via the SEARCH_INITIALIZING gate
+        # above until the build completes, then search works normally.
         if getattr(vectors, "_active_companion_name", None) != active_companion:
-            print(f"🔎 Dynamically reloading vector DB for companion '{active_companion}'")
-            vectors.init_vector_store(locs["SEARCH_REFERENCE_LOCATIONS"], companion_name=active_companion)
+            print(f"🔎 vector_search skipped — initializing vector store for "
+                  f"'{active_companion}' in background")
+            asyncio.create_task(asyncio.to_thread(
+                vectors.init_vector_store,
+                locs["SEARCH_REFERENCE_LOCATIONS"],
+                companion_name=active_companion,
+            ))
+            return full_messages
 
         if vectors.is_available():
             if config.SEARCH_REFERENCES_HIGH_CARDINALITY_ONLY:
@@ -313,15 +337,31 @@ async def inject_search_context(full_messages, combined_content, ctx, search_ref
             else:
                 vector_query = combined_content
 
+            # Re-check after the keyword-extraction await: a !switchCompanion
+            # completing in that window swaps vectors._collection to the new
+            # companion, and querying it here would inject the WRONG
+            # persona's reference content into this channel's prompt.
+            if (vector_query is not None
+                    and getattr(vectors, "_active_companion_name", None) != active_companion):
+                print(f"🔎 vector_search skipped — active companion changed "
+                      f"during keyword extraction")
+                return full_messages
+
             if vector_query is not None:
                 search_token_budget, budget_max_chars, used_tokens = _calculate_search_budget(
-                    full_messages, ctx.current_context_limit
+                    full_messages, ctx.current_context_limit,
+                    channel_key=ctx.channel_name,
                 )
                 print(f"🔎 vector_search budget: {search_token_budget} tokens "
                       f"(~{tokens_to_bytes(search_token_budget, channel_key=ctx.channel_name)} bytes) — context used "
                       f"{used_tokens:,}/{ctx.current_context_limit:,}")
                 print(f"🔎 vector_search query: {vector_query[:80]}")
-                search_results, result_chunks, raw_chunks, raw_chars, collection_total, relevant_count = vectors.search_vectors(
+                # Run off the event loop: search_vectors embeds the query
+                # through the ONNX model (lazy-loading ~2.3 GB on first use),
+                # and blocking the loop here freezes heartbeats, typing
+                # indicators, and every other channel for seconds per search.
+                search_results, result_chunks, raw_chunks, raw_chars, collection_total, relevant_count = await asyncio.to_thread(
+                    vectors.search_vectors,
                     vector_query,
                     max_results=0,
                     max_chars=budget_max_chars,
@@ -351,7 +391,8 @@ async def inject_search_context(full_messages, combined_content, ctx, search_ref
               f"NO_QUESTION (no searchable question detected in prompt)")
         else:
             search_token_budget, sem_max_buffer, used_tokens = _calculate_search_budget(
-                full_messages, ctx.current_context_limit
+                full_messages, ctx.current_context_limit,
+                channel_key=ctx.channel_name,
             )
             print(f"🔎 semantic_search budget: {search_token_budget} tokens "
                   f"(~{tokens_to_bytes(search_token_budget, channel_key=ctx.channel_name)} bytes) — context used "
