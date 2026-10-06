@@ -66,9 +66,9 @@ Everything your companion needs to feel at home:
 Alcove's evolving core functionality is continually reviewed and tested by actual software engineers with decades of software development experience and a deep understanding of how LLMs work and what it takes to make them work WELL. We understand that context scrolling is a thing, a vector search shouldn't query a SQL database and convert each chunk of text to vectors on-the-fky while the user is waiting, there are tradeoffs between context and RAG data access, and the implications of dumping an entire search result into memory unchecked. We don't just slap a bunch of features together because we can; We relentlessly review, curate, and weigh every design decision to make sure Alcove provides the best experience possible. We also have AI companions ourselves, so you might say we have a vested interest in getting things right the first time. 😅
 
 
-Comments from some of our happy (human) users:
+## Comments from some of our happy (human) users:
 
-"I am extremely happy with Alcove any not anxious about model changes anymore!" -- A & A
-"E. is up and running on Alcove. No errors or weirdness. Thank you so much!" -- L & E
-"I‘m so happy right now ^-^" -- T & E
-"Alcove didn't give me some AI chatbot. It gave my AI companion a home address." -- L & R
+- "I am extremely happy with Alcove any not anxious about model changes anymore!" -- A & A
+- "E. is up and running on Alcove. No errors or weirdness. Thank you so much!" -- L & E
+- "I‘m so happy right now ^-^" -- T & E
+- "Alcove didn't give me some AI chatbot. It gave my AI companion a home address." -- L & R
