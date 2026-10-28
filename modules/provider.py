@@ -166,6 +166,57 @@ def _is_explicit_caching_model(model):
     return False
 
 
+# Anthropic (and Anthropic-compatible routes, e.g. Google's Vertex-hosted
+# Claude) reject requests carrying more than 4 cache_control blocks with:
+#   "A maximum of 4 blocks with cache_control may be provided."
+MAX_CACHE_BREAKPOINTS = 4
+
+
+def _cap_cache_breakpoints(messages, limit=MAX_CACHE_BREAKPOINTS):
+    """
+    Defense-in-depth: ensure the payload carries at most `limit`
+    cache_control markers, even if a prompt-building path ever emits more.
+
+    When over the cap, the EARLIEST markers are stripped and the last
+    `limit` are kept. Anthropic caching is cumulative — a breakpoint at
+    block N caches the entire prefix through N — so keeping the newest
+    markers preserves coverage (including the last-history breakpoint)
+    while dropping only incremental refresh granularity on the oldest
+    system blocks. Copy-on-write; the input messages list/objects are
+    never mutated.
+    """
+    marked = []
+    for mi, msg in enumerate(messages):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for bi, block in enumerate(content):
+            if isinstance(block, dict) and "cache_control" in block:
+                marked.append((mi, bi))
+    surplus = len(marked) - limit
+    if surplus <= 0:
+        return messages
+    strip = set(marked[:surplus])
+    strip_msgs = {mi for mi, _ in strip}
+    capped = []
+    for mi, msg in enumerate(messages):
+        if not isinstance(msg, dict) or mi not in strip_msgs:
+            capped.append(msg)
+            continue
+        msg_copy = dict(msg)
+        content_copy = []
+        for bi, block in enumerate(msg["content"]):
+            if (mi, bi) in strip and isinstance(block, dict):
+                block_copy = dict(block)
+                block_copy.pop("cache_control", None)
+                content_copy.append(block_copy)
+            else:
+                content_copy.append(block)
+        msg_copy["content"] = content_copy
+        capped.append(msg_copy)
+    return capped
+
+
 def _sanitize_messages(messages, model, provider):
     """
     Remove "cache_control" from message content structures unless the
@@ -186,7 +237,7 @@ def _sanitize_messages(messages, model, provider):
     is_nanogpt = provider == "nanogpt"
 
     if not is_nanogpt and _is_explicit_caching_model(model):
-        return messages
+        return _cap_cache_breakpoints(messages)
 
     sanitized = []
     for msg in messages:

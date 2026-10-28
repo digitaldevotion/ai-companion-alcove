@@ -143,9 +143,10 @@ NEEDS_INFERENCE = {}
 # --- Skills context (populated by main._load_skills_context at boot + refresh) ---
 # Concatenated YAML front-matter bodies of skills/*/skill.md files, each
 # followed by the file's absolute path, wrapped in START/END markers. Read
-# by prompt.build_llm_main_prompt and injected into the system block right
-# after the Tool Definitions block. Empty string when no skills are present
-# (block is omitted entirely in that case).
+# by prompt.build_llm_main_prompt and injected INTO the Tool Definitions
+# block (merged there so marked system blocks stay within Anthropic's
+# 4-breakpoint cap). Empty string when no skills are present (the section
+# is omitted entirely in that case).
 SKILLS_CONTEXT = ""
 
 # --- Vector store initialization state (shared across main/idle/commands/search/vectors) ---

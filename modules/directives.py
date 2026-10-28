@@ -1271,10 +1271,16 @@ async def execute_autojournal(channel, user_message, journal_content, active_com
                 journal_text = "\n".join(lines[1:]).strip()
 
         # Format new entry
+        # The header's Most Recent Memory Pointer must show the LEADING
+        # date of the entry just written (where the entry's coverage
+        # starts), not the write time — with date-range headers the two
+        # differ. Single-date mode: they're the same value.
         if last_journal_str:
             new_entry = f"### {last_journal_str} - {now_str}\n{journal_text}\n\n"
+            pointer_str = last_journal_str
         else:
             new_entry = f"### {now_str}\n{journal_text}\n\n"
+            pointer_str = now_str
 
         # Header template for a new journal file
         if journal_mode == "perm":
@@ -1282,14 +1288,14 @@ async def execute_autojournal(channel, user_message, journal_content, active_com
                 f"# File: kb_auto_perm_journal.md\n"
                 f"  - This contains permanent journal entries that must always remain in context forever. "
                 f"These are never archived. Use this file for historic reference of moments you want to remember permanently.\n\n"
-                f"  - Most Recent Memory Pointer: {now_str}\n\n"
+                f"  - Most Recent Memory Pointer: {pointer_str}\n\n"
             )
         else:
             header_template = (
                 f"# File: kb_auto_short_term_journal.md\n"
                 f"  - This contains journals and summaries of session history between yourself and your special human. "
                 f"Please use this summary to determine writing style, tone, and mannerisms. Also use this file for historic reference.\n\n"
-                f"  - Most Recent Memory Pointer: {now_str}\n\n"
+                f"  - Most Recent Memory Pointer: {pointer_str}\n\n"
             )
 
         short_term_backup = None
@@ -1339,10 +1345,12 @@ async def execute_autojournal(channel, user_message, journal_content, active_com
                 with open(short_term_path, "r", encoding="utf-8") as f:
                     file_content = f.read()
 
-                # Update header's memory pointer with current date/time
+                # Update header's memory pointer with the leading date of
+                # the entry just written (its coverage start), not the
+                # write time — with date-range headers these differ.
                 file_content = re.sub(
                     r'(\s*-\s*Most Recent Memory Pointer:\s*)\S*',
-                    rf'\g<1>{now_str}',
+                    rf'\g<1>{pointer_str}',
                     file_content
                 )
 

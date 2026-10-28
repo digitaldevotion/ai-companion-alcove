@@ -118,8 +118,7 @@ def _build_context_detailed(layers, history, channel_name, current_context_limit
     label_order = [
         "System Prompt",
         "Secondary Instructions",
-        "Tool Definitions",
-        "Skill Definitions",
+        "Tool & Skill Defs",
         "History Context",
         "Reference Context",
         "Dynamic Files",
@@ -130,8 +129,7 @@ def _build_context_detailed(layers, history, channel_name, current_context_limit
     bar_labels = {
         "System Prompt": "S",
         "Secondary Instructions": "I",
-        "Tool Definitions": "T",
-        "Skill Definitions": "K",
+        "Tool & Skill Defs": "T",
         "History Context": "H",
         "Reference Context": "R",
         "Dynamic Files": "D",
@@ -145,8 +143,6 @@ def _build_context_detailed(layers, history, channel_name, current_context_limit
     for name in label_order:
         t = layer_tokens.get(name, 0)
         if name == "Dynamic Files" and t == 0:
-            continue
-        if name == "Skill Definitions" and t == 0:
             continue
         filled = int((t / current_context_limit) * BAR_WIDTH) if current_context_limit else 0
         filled = max(filled, 1) if t > 0 else 0
@@ -1820,12 +1816,16 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
 
         if new_prompt:
             # Delete the last assistant response AND the last user prompt,
-            # then resubmit with the rewritten prompt.
+            # then resubmit with the rewritten prompt. The assistant delete is
+            # scoped to rows newer than the last user prompt (id >): when the
+            # channel ends with an unanswered prompt — e.g. its inference
+            # timed out and no assistant row was saved — nothing is deleted
+            # instead of the previous exchange's response.
             cursor.execute(
-                "DELETE FROM messages WHERE id = ("
-                "  SELECT id FROM messages WHERE channel = ? AND role = 'assistant' "
-                "  ORDER BY id DESC LIMIT 1"
-                ")", (channel_name,)
+                "DELETE FROM messages WHERE channel = ? AND role = 'assistant' "
+                "AND id > (SELECT id FROM messages WHERE channel = ? AND role = 'user' "
+                "          ORDER BY id DESC LIMIT 1)",
+                (channel_name, channel_name)
             )
             cursor.execute(
                 "DELETE FROM messages WHERE id = ("
@@ -1847,16 +1847,16 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
                 "carry_prior_attachments": False,
             }
         else:
-            # Recover the last user prompt text, then delete BOTH the last
-            # assistant response and the last user entry. We delete + re-save
-            # rather than leaving the user turn in place because the DB only
-            # stores text — any image / voice / file attachments from the
-            # original message would be lost. Re-running through the normal
-            # pipeline (with media re-attached from the channel's stored
-            # last_media_discord_msg_id anchor) preserves them on the
-            # regenerated turn.
+            # Recover the last user prompt text, then delete the assistant
+            # response(s) that answered it and the user entry itself. We
+            # delete + re-save rather than leaving the user turn in place
+            # because the DB only stores text — any image / voice / file
+            # attachments from the original message would be lost. Re-running
+            # through the normal pipeline (with media re-attached from the
+            # channel's stored last_media_discord_msg_id anchor) preserves
+            # them on the regenerated turn.
             cursor.execute(
-                "SELECT content FROM messages WHERE channel = ? AND role = 'user' "
+                "SELECT id, content FROM messages WHERE channel = ? AND role = 'user' "
                 "ORDER BY id DESC LIMIT 1",
                 (channel_name,)
             )
@@ -1864,7 +1864,7 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
             if not row:
                 await message.channel.send("*No user message found to regenerate from.*")
                 return True
-            last_user_prompt = row[0]
+            _last_user_id, last_user_prompt = row
             # Detect and strip the trailing attachment-tag cluster
             # ("[image]" / "[audio]" / "[video]") added when the original
             # message was saved — the media itself is re-attached by the
@@ -1877,17 +1877,19 @@ async def handle_command(message, cmd, content, channel_name, guild_name,
             if media_cluster:
                 last_user_prompt = last_user_prompt[:media_cluster.start()].rstrip()
 
+            # Delete only the assistant rows that answered THIS prompt
+            # (id > its row id). If the prompt was never answered — e.g. its
+            # inference timed out and the *Error...* reply was never saved —
+            # nothing is deleted here and the previous exchange's response
+            # stays intact.
             cursor.execute(
-                "DELETE FROM messages WHERE id = ("
-                "  SELECT id FROM messages WHERE channel = ? AND role = 'assistant' "
-                "  ORDER BY id DESC LIMIT 1"
-                ")", (channel_name,)
+                "DELETE FROM messages WHERE channel = ? AND role = 'assistant' "
+                "AND id > ?",
+                (channel_name, _last_user_id)
             )
             cursor.execute(
-                "DELETE FROM messages WHERE id = ("
-                "  SELECT id FROM messages WHERE channel = ? AND role = 'user' "
-                "  ORDER BY id DESC LIMIT 1"
-                ")", (channel_name,)
+                "DELETE FROM messages WHERE id = ?",
+                (_last_user_id,)
             )
             db.commit()
             # save_user_prompt=True so on_message rebuilds the user turn via

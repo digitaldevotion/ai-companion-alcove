@@ -280,16 +280,15 @@ a red rubber ball
     \n
     """
 
-    layers["Tool Definitions"] = tool_context.strip() if tool_context.strip() else ""
-
-    if tool_context:
-        system_block.append({
-            "type": "text",
-            "text": tool_context,
-            "cache_control": {"type": "ephemeral"}
-        })
-
-    # --- Block 2b: skill definitions ---
+    # --- Block 2b: skill definitions (merged INTO the tool block) ---
+    # DESIGN NOTE — skills are folded into tool_context rather than shipped
+    # as their own marked system block. Anthropic caps requests at 4
+    # cache_control breakpoints; a separate skills block let payloads reach
+    # 5-6 markers and 400 on Claude. Merging keeps the marked system blocks
+    # at exactly 3 (instructions, tools+skills, reference) with the 4th
+    # marker on the last history message — cumulative prefix caching still
+    # covers the stable skills content.
+    #
     # Loaded once at boot (and refreshed periodically by idle's
     # auto_discover_paths_task) into state.SKILLS_CONTEXT by
     # main._load_skills_context. Each entry is a skill.md's YAML front-matter
@@ -297,12 +296,18 @@ a red rubber ball
     # Omitted entirely when no skills are installed (empty string).
     skills_context = getattr(state, "SKILLS_CONTEXT", "")
     if skills_context:
+        # SKILLS_CONTEXT arrives pre-fenced by main._load_skills_context
+        # (# START/END OF SKILL DEFINITIONS markers) — no outer fence needed here.
+        tool_context += f"\n{skills_context}\n"
+
+    layers["Tool & Skill Defs"] = tool_context.strip() if tool_context.strip() else ""
+
+    if tool_context:
         system_block.append({
             "type": "text",
-            "text": skills_context,
+            "text": tool_context,
             "cache_control": {"type": "ephemeral"}
         })
-    layers["Skill Definitions"] = skills_context
 
     # --- Block 3: knowledge + misc references + anchored memories ---
     # DESIGN NOTE — which location lists feed the system block vs. the
@@ -364,6 +369,13 @@ a red rubber ball
             reference_context += anchor_text
             anchor_parts.append(anchor_text)
 
+    # Social-mode indicator rides INSIDE the reference block. It used to be
+    # its own 5th marked system block, which — combined with skills and the
+    # last-history breakpoint — pushed payloads past Anthropic's 4-breakpoint
+    # cache_control cap. Folding it here keeps the marked system blocks at 3.
+    if social_mode:
+        reference_context += _SOCIAL_MODE_INDICATOR
+
     layers["History Context"] = "".join(history_context_parts) if history_context_parts else ""
     layers["Reference Context"] = "".join(ref_context_parts) if ref_context_parts else ""
     layers["Dynamic Files"] = "".join(dynamic_parts) if dynamic_parts else ""
@@ -374,14 +386,6 @@ a red rubber ball
         system_block.append({
             "type": "text",
             "text": reference_context,
-            "cache_control": {"type": "ephemeral"}
-        })
-
-    # --- Block 4: social mode indicator ---
-    if social_mode:
-        system_block.append({
-            "type": "text",
-            "text": _SOCIAL_MODE_INDICATOR,
             "cache_control": {"type": "ephemeral"}
         })
 

@@ -258,8 +258,9 @@ TYPING_DEFER_RECHECK_SECONDS = 4
 # extracts the leading YAML front-matter block (delimited by --- lines),
 # appends each file's absolute path, and concatenates all of them into one
 # string stored in state.SKILLS_CONTEXT. This is read by llm_prompt_builder.py at
-# build_llm_main_prompt time and injected into the system block right after
-# the Tool Definitions block. Re-invoked periodically by idle's
+# build_llm_main_prompt time and injected INTO the Tool Definitions block
+# (merged there so marked system blocks stay within Anthropic's 4-breakpoint
+# cache_control cap). Re-invoked periodically by idle's
 # auto_discover_paths_task so newly added/edited skills are picked up
 # without a bot restart.
 # ============================================

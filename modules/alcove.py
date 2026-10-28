@@ -54,7 +54,7 @@ import certifi
 
 config = None  # loaded dynamically after check_config_exists()
 
-VERSION = "3.0.0"
+VERSION = "3.0.3"
 
 LOGO = rf"""
     _    _     ____ _____     _______
