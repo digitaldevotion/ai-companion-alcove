@@ -6,13 +6,25 @@ LICENSE
 
 Alcove is distributed as FREEWARE. This means:
 
-  - You may freely copy and distribute this software in its unmodified form.
-  - You may NOT modify, alter, reverse-engineer, or create derivative works
-    based on this software without the express written permission of the author.
-  - You may NOT sell, sublicense, or otherwise commercially redistribute this
-    software or any portion thereof without the express written permission of
-    the author.
-  - You must include this readme.txt file with any distribution of the software.
+1. You may freely copy and distribute the unmodified software and its
+  accompanying README file, at no charge.
+
+2. You may modify the software for your own private, personal use.
+   However, you may NOT distribute, publish, or share modified versions,
+   in whole or in part, without the express written permission of the
+   author.
+  
+3. You may NOT create derivative works based on this software - including
+   ports, reimplementations, translations, or adaptations of its design,
+   architecture, or functionality, in whole or in substantial part -
+   without the express written permission of the author.
+  
+4. You may NOT sell, sublicense, or commercially redistribute this
+   software or any portion thereof, modified or unmodified, without the
+   express written permission of the author.
+  
+5. You must include this README file, unaltered, with any distribution
+   of the software.
 
 
 DISCLAIMER OF WARRANTY
