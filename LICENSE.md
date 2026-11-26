@@ -21,8 +21,11 @@ the Software.
      to the extent expressly permitted by applicable law).
    - Sell, rent, lease, sublicense, use for commercial purposes, or otherwise
      commercially redistribute the Software or any portion thereof (including
-     bundling it with paid products or services, or operating it on a paid
-     or commercial server).
+     bundling it with paid products or services, offering it as a hosted
+     service, or operating it on a monetized or commercial Discord server).
+     For clarity, hosting your own personal, non-commercial instance of the
+     Software on paid third-party infrastructure (such as a VPS or cloud
+     provider like AWS EC2) is permitted.
    - Remove or alter any copyright notices, trademarks, or license files
      included with the Software.
 
