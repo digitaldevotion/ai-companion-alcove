@@ -22,7 +22,7 @@ the Software.
    - Sell, rent, lease, sublicense, use for commercial purposes, or otherwise
      commercially redistribute the Software or any portion thereof (including
      bundling it with paid products or services, offering it as a hosted
-     service, or operating it on a monetized or commercial Discord server).
+     service, or operating it on a monetized or commercial server).
      For clarity, hosting your own personal, non-commercial instance of the
      Software on paid third-party infrastructure (such as a VPS or cloud
      provider like AWS EC2) is permitted.
